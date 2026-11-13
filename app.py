@@ -75,41 +75,50 @@ def get_current_academic_year():
     return f"{y} — {y + 1} م" if now.month >= 9 else f"{y - 1} — {y} م"
 
 def discover_gemini_models_and_keys():
-    candidates = [
+    preferred = [
         "gemini-3-flash-preview",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash",
         "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash"
+        "gemini-2.5-flash-lite",
+        "gemini-flash-lite-latest"
     ]
     working_keys = [k for k in GEMINI_KEYS if k]
     if not working_keys:
-        return [], candidates[:3]
+        return [], preferred[:3]
     test_k = working_keys[0]
-    def _probe_model(m_name):
+    discovered = []
+    try:
+        r = _HTTP_SESSION.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={test_k}", timeout=8)
+        if r.status_code == 200:
+            avail = {m.get("name", "").replace("models/", "") for m in r.json().get("models", [])}
+            for pm in preferred:
+                if pm in avail and pm not in discovered:
+                    discovered.append(pm)
+            for am in sorted(avail, reverse=True):
+                if ("flash" in am) and not any(x in am for x in ("tts", "image", "audio", "live", "8b", "robotics", "computer-use", "customtools", "lite-preview")) and am not in discovered:
+                    discovered.append(am)
+    except Exception:
+        pass
+    candidates = discovered[:5] if discovered else preferred
+
+    def _probe(m_name):
         try:
             u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={test_k}"
-            r = requests.post(u, json={"contents": [{"parts": [{"text": "ok"}]}], "generationConfig": {"maxOutputTokens": 5}}, timeout=8)
-            if r.status_code == 200:
+            rp = requests.post(u, json={"contents": [{"parts": [{"text": "ok"}]}], "generationConfig": {"maxOutputTokens": 5}}, timeout=10)
+            if rp.status_code == 200:
                 return m_name
         except Exception:
             pass
         return None
+
     live_models = []
-    with ThreadPoolExecutor(max_workers=9) as ex:
-        for res_m in ex.map(_probe_model, candidates):
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for res_m in ex.map(_probe, candidates):
             if res_m and res_m not in live_models:
                 live_models.append(res_m)
-    if not live_models:
-        live_models = ["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-    return working_keys, live_models
+    return working_keys, (live_models if live_models else ["gemini-2.5-flash", "gemini-flash-latest"])
 
 WORKING_GEMINI_KEYS, ACTIVE_GEMINI_MODELS = discover_gemini_models_and_keys()
-
 def get_next_gemini_key():
     global _gemkey_idx
     with _key_lock:
@@ -429,7 +438,7 @@ def extract_json_safely(raw_text):
         except Exception:
             pass
     repaired = {}
-    for list_key in ["paragraphs", "healed_paragraphs", "intro_paragraphs", "importance_paragraphs", "methodology_plan_paragraphs", "findings", "recommendations", "items", "cited_ref_indices", "references_ar", "references_books", "references_en"]:
+    for list_key in ["paragraphs", "healed_paragraphs", "intro_paragraphs", "importance_paragraphs", "methodology_plan_paragraphs", "findings", "recommendations", "items", "cited_ref_indices", "references_ar", "references_books", "references_en", "healed_findings", "healed_recommendations"]:
         m_arr = re.search(rf'"{list_key}"\s*:\s*\[(.*?)(?:\]|$)', cleaned, flags=re.DOTALL)
         if m_arr:
             if list_key == "cited_ref_indices":
@@ -440,43 +449,34 @@ def extract_json_safely(raw_text):
                 items_found = re.findall(r'"((?:[^"\\]|\\.)*)"', m_arr.group(1), flags=re.DOTALL)
                 if items_found:
                     repaired[list_key] = [x.replace('\\"', '"').replace('\\n', ' ').strip() for x in items_found if len(x.strip()) > 3]
-    for str_key in ["clean_title", "specialty", "college_name", "university_name", "student_name", "supervisor_name", "academic_year", "commentary", "dedication", "abstract_ar", "abstract_en", "keywords_ar", "keywords_en", "conclusion_intro", "translated_title", "manager_reply"]:
+    for str_key in ["clean_title", "specialty", "college_name", "university_name", "student_name", "supervisor_name", "academic_year", "commentary", "dedication", "abstract_ar", "abstract_en", "keywords_ar", "keywords_en", "conclusion_intro", "healed_conclusion_intro", "translated_title", "manager_reply"]:
         m_str = re.search(rf'"{str_key}"\s*:\s*"((?:[^"\\]|\\.)*)"', cleaned, flags=re.DOTALL)
         if m_str:
             repaired[str_key] = m_str.group(1).replace('\\"', '"').strip()
     return repaired
 
-def ask_agent(prompt_text, agent_role="writer", json_mode=True, required_keys=None, live_blueprint=None, use_google_search=False):
-    """
-    المحرك النقي الموحد (Gemini 3.8 / 3.6 / 2.5 Flash حصراً):
-    1. يدور على جميع المفاتيح الـ 8 في أقوى نموذج أولاً قبل الانتقال للنموذج الذي يليه.
-    2. يفعل أداة بحث جوجل الحقيقي ("google_search") عندما يُطلب منه البحث في الويب أو المراجعة الشاملة.
-    """
+def ask_agent(prompt_text, agent_role="writer", json_mode=True, required_keys=None, live_blueprint=None, use_google_search=False, media_parts=None):
     learned_str = get_memory_prompt()
-    live_ctx = f"\n\n[البصمة المنهجية المستخرجة من الأبحاث المنشورة في هذا الموضوع]:\n{live_blueprint}\n" if live_blueprint else ""
+    live_ctx = f"\n\n[ميثاق الدقة والمنهجية الخاص بهذا البحث]:\n{live_blueprint}\n" if live_blueprint else ""
 
     role_prompts = {
-        "scout": (
-            "أنت الوكيل المعماري الأكاديمي والمدير التفاعلي في الجامعات العراقية. "
-            "لديك وصول مباشر لمحرك بحث Google الحقيقي. افهم طلب المستخدم بدقة واستخرج كافة بيانات البحث بصيغة JSON."
-        ),
+        "scout": "أنت الوكيل المعماري الأكاديمي في الجامعات العراقية. استخرج كافة بيانات البحث وتوجيهاته بدقة بصيغة JSON.",
         "calibrator": (
-            "أنت مهندس البحث الأكاديمي الحي في الجامعات العراقية. "
-            "ابحث في Google والباحث العلمي والمجلات العراقية المحكمة (iasj.rdd.edu.iq) عن الأبحاث والكتب المنشورة والمقبولة فعلياً في نفس موضوع البحث وتخصصه الدقيق، "
-            "واقرأ منهجيتها وتقسيماتها، واستخرج منها خطة البحث الأصيلة والمصادر الحقيقية الموثقة 100% بصيغة JSON."
+            "أنت مهندس البحث الأكاديمي الحي. حلل موضوع البحث وتخصصه الدقيق، واستنتج المعايير والبراهين الإلزامية في هذا التخصص، "
+            "وابنِ خطة البحث والمصادر الحقيقية الموثقة بصيغة JSON."
         ),
         "writer": (
-            f"أنت أستاذ دكتور وباحث أكاديمي قدير في الجامعات العراقية.{live_ctx}\n"
-            f"تلتزم بالقواعد الأكاديمية التالية:\n{learned_str}\n"
-            "قواعد الصياغة الإلزامية:\n"
-            "1. اكتب المتن العلمي بأسلوب أكاديمي تحليلي رصين ومفصل يشرح جوهر الموضوع نفسه مباشرة (المفاهيم، الأسس، الآليات، المعادلات أو النصوص أو التحليل) دون تحويل المتن إلى سرد لأسماء الباحثين.\n"
-            "2. نوّع مطالع الفقرات وأدوات الربط الأكاديمية (ينطلق التأصيل، وفي هذا الإطار، وتأسيساً على ذلك، وعند موازنة هذه المعطيات) ويُمنع تكرار (تُعدّ / يُعدّ) في بداية فقرتين متتاليتين.\n"
-            "3. لا تكتب أي رموز مرجعية مربعة مثل [0] أو [REF_1] داخل نص الفقرة العربية، وأنهِ كل فقرة بنقطة تامة."
+            f"أنت باحث وأستاذ أكاديمي قدير في الجامعات العراقية.{live_ctx}\n"
+            f"القواعد الحاكمة:\n{learned_str}\n"
+            "قواعد الصياغة:\n"
+            "1. اكتب بأسلوب تحليلي عميق ومباشر يوظف الأدلة والمعايير المعتمدة في التخصص ذاته دون سرد إنشائي أو حشو.\n"
+            "2. نوّع بدايات الفقرات وأدوات الربط تنوعاً كاملاً في كل قسم، ويُمنع تكرار نفس الجملة الاستهلالية.\n"
+            "3. لا تضع أي رموز مرجعية مربعة مثل [0] أو [REF_1] داخل المتن، وأنهِ كل فقرة بنقطة تامة."
         ),
         "auditor": (
-            f"أنت المدقق الأكاديمي الشامل ورئيس اللجنة العلمية (Editor-in-Chief).{live_ctx}\n"
-            f"تلتزم بالقواعد التالية:\n{learned_str}\n"
-            "مهمتك قراءة التقرير والفقرات والمصادر بوعي كامل كما يقرؤها أستاذ جامعي فاحص، وكشف أي خطأ علمي أو منهجي أو مصدري وإصلاحه فوراً."
+            f"أنت المدقق الأكاديمي الأعلى (Editor-in-Chief).{live_ctx}\n"
+            f"القواعد الحاكمة:\n{learned_str}\n"
+            "افحص المسودة والمصادر بعين أستاذ جامعي فاحص، واكشف أي خطأ علمي أو تناقض زمني أو مرجع دخيل وأصلحه."
         )
     }
     sys_msg = role_prompts.get(agent_role, role_prompts["writer"])
@@ -497,69 +497,74 @@ def ask_agent(prompt_text, agent_role="writer", json_mode=True, required_keys=No
                     return False
         return True
 
+    user_parts = [{"text": prompt_text}]
+    if media_parts:
+        user_parts.extend(media_parts)
+
     last_non_empty = ""
-    models_to_try = ACTIVE_GEMINI_MODELS if ACTIVE_GEMINI_MODELS else ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
+    models_to_try = ACTIVE_GEMINI_MODELS if ACTIVE_GEMINI_MODELS else ["gemini-3-flash-preview", "gemini-2.5-flash"]
     num_keys = max(1, len(WORKING_GEMINI_KEYS))
 
-    # التناوب على جميع المفاتيح الـ 8 في النموذج الأقوى أولاً قبل النزول للنموذج التالي
-    for model_name in models_to_try:
-        model_overloaded = False
-        for _ in range(num_keys):
-            gem_key = get_next_gemini_key()
-            if not gem_key:
-                break
-            url_gem = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gem_key}"
-            hdrs_gem = {"Content-Type": "application/json"}
-            gen_cfg = {"temperature": 0.25, "maxOutputTokens": 8192}
-            if json_mode:
-                gen_cfg["responseMimeType"] = "application/json"
-            payload = {
-                "systemInstruction": {"parts": [{"text": sys_msg}]},
-                "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
-                "generationConfig": gen_cfg
-            }
-            try:
-                r_gem = _HTTP_SESSION.post(url_gem, json=payload, headers=hdrs_gem, timeout=65)
-                if r_gem.status_code == 200:
-                    cands = r_gem.json().get("candidates") or []
-                    if cands:
-                        parts = cands[0].get("content", {}).get("parts") or []
-                        txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text") and not p.get("thought")])
-                        if not txt_joined.strip():
-                            txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text")])
-                        txt = re.sub(r'<think>.*?</think>', '', txt_joined, flags=re.DOTALL).strip()
-                        if txt:
-                            last_non_empty = txt
-                        if _is_valid_output(txt):
-                            return txt
+    for attempt_round in range(2):
+        if attempt_round == 1:
+            time.sleep(14)
+        for model_name in models_to_try:
+            model_overloaded = False
+            for _ in range(num_keys):
+                gem_key = get_next_gemini_key()
+                if not gem_key:
                     break
-                elif r_gem.status_code == 400 and json_mode:
-                    payload["generationConfig"].pop("responseMimeType", None)
-                    r_retry = _HTTP_SESSION.post(url_gem, json=payload, headers=hdrs_gem, timeout=65)
-                    if r_retry.status_code == 200:
-                        cands = r_retry.json().get("candidates") or []
-                        if cands:
-                            parts = cands[0].get("content", {}).get("parts") or []
-                            txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text")])
-                            txt = re.sub(r'<think>.*?</think>', '', txt_joined, flags=re.DOTALL).strip()
-                            if txt:
-                                last_non_empty = txt
-                            if _is_valid_output(txt):
-                                return txt
+                url_gem = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gem_key}"
+                hdrs_gem = {"Content-Type": "application/json"}
+                modes_to_try = [(True, False), (False, json_mode), (False, False)] if use_google_search else ([(False, True), (False, False)] if json_mode else [(False, False)])
+
+                for s_mode, use_mime in modes_to_try:
+                    gen_cfg = {"temperature": 0.25, "maxOutputTokens": 8192}
+                    if use_mime:
+                        gen_cfg["responseMimeType"] = "application/json"
+                    payload = {
+                        "systemInstruction": {"parts": [{"text": sys_msg}]},
+                        "contents": [{"role": "user", "parts": user_parts}],
+                        "generationConfig": gen_cfg
+                    }
+                    if s_mode:
+                        payload["tools"] = [{"google_search": {}}]
+                    try:
+                        r_gem = _HTTP_SESSION.post(url_gem, json=payload, headers=hdrs_gem, timeout=90)
+                        if r_gem.status_code == 200:
+                            cands = r_gem.json().get("candidates") or []
+                            if cands:
+                                parts = cands[0].get("content", {}).get("parts") or []
+                                txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text") and not p.get("thought")])
+                                if not txt_joined.strip():
+                                    txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text")])
+                                txt = re.sub(r'<think>.*?</think>', '', txt_joined, flags=re.DOTALL).strip()
+                                if txt:
+                                    last_non_empty = txt
+                                if _is_valid_output(txt):
+                                    return txt
+                            break
+                        elif r_gem.status_code == 400:
+                            log_runtime_error(f"Gemini {model_name} 400", r_gem.text[:140])
+                            continue
+                        elif r_gem.status_code == 429:
+                            log_runtime_error(f"Gemini {model_name} 429", "Rate limit")
+                            time.sleep(0.5)
+                            break
+                        elif r_gem.status_code in (404, 500, 503):
+                            log_runtime_error(f"Gemini {model_name} {r_gem.status_code}", r_gem.text[:120])
+                            model_overloaded = True
+                            break
+                        else:
+                            log_runtime_error(f"Gemini {model_name} {r_gem.status_code}", r_gem.text[:140])
+                            break
+                    except Exception as e:
+                        log_runtime_error(f"Gemini {model_name} EXC", e)
+                        break
+                if model_overloaded:
                     break
-                elif r_gem.status_code == 429:
-                    time.sleep(0.2)
-                    continue
-                elif r_gem.status_code in (404, 500, 503):
-                    model_overloaded = True
-                    break
-                else:
-                    break
-            except Exception as e:
-                log_runtime_error(f"Gemini {model_name}", e)
-                break
-        if model_overloaded:
-            continue
+            if model_overloaded:
+                continue
 
     if last_non_empty:
         return last_non_empty
