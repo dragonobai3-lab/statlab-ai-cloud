@@ -225,9 +225,9 @@ def load_learned_memory():
         except Exception:
             pass
     return [
-        "التزم بصيغة الفعل الماضي والغائب الأكاديمي الرصين، وادخل في التحليل العلمي مباشرة دون قول (برهن الباحث، قارن الباحث، ركز الباحث، استند الباحث).",
-        "نوّع مطالع الفقرات وأدوات الربط الأكاديمية (ينطلق التأصيل، وفي هذا الإطار، وتأسيساً على ذلك، وعند موازنة هذه المعطيات) ويُمنع بدء فقرتين متتاليتين بـ (تُعدّ / يُعدّ).",
-        "التزم حصراً بالمراجع والأبحاث الحقيقية المستخرجة من بحث جوجل العلمي والويب المطابقة للموضوع بدقة 100% ولا تختلق أي مرجع خارجي."
+        "التزم بالأسلوب الأكاديمي الرصين والمباشر دون سرد لأسماء الباحثين، وتجنب تكرار القوالب الإنشائية أو نفس الجمل الاستهلالية بين الفقرات.",
+        "حافظ على التناسق الزمني والعلمي الصارم: يُمنع عزو أي تشريع أو تقنية أو دراسة حديثة إلى مصدر منشور قبل تاريخها، ولا تخمن أرقام مواد قانونية أو معادلات غير موثقة.",
+        "التزم حصراً بالمراجع الحقيقية الموثقة بلغتها الأصلية، ولا تترجم مصدراً أجنبياً لإدراجه كمصدر عربي، ولا تختلق أي كتاب أو مؤلف."
     ]
 
 def add_learned_rule(new_rule):
@@ -722,9 +722,9 @@ def parse_and_calibrate_order(raw_user_text):
     التعليمات الصارمة:
     1. استخرج العنوان الأكاديمي الصافي ("clean_title") والتخصص ("specialty") والكلية ("college_name") والجامعة ("university_name") وفئة الغلاف ("category_code": "law" أو "economics" أو "medical" أو "engineering" أو "humanities").
     2. في حقول المراجع ("references_books", "references_ar", "references_en"):
-       - انتقِ أولاً كل مرجع من القائمة المسحوبة أعلاه يطابق موضوع البحث وتخصصه فعلياً (مع الاحتفاظ باسم المؤلف الحقيقي والسنة والمجلة وأرقام الصفحات، وتعريب عنوان البحث العراقي المكتوب بالإنجليزية إلى العربية الفصحى في "references_ar").
+       - انتقِ أولاً كل مرجع من القائمة المسحوبة أعلاه يطابق موضوع البحث وتخصصه فعلياً (مع الاحتفاظ باسم المؤلف الحقيقي والسنة والمجلة وأرقام الصفحات، وعدم ترجمة أي بحث إنجليزي لوضعه في "references_ar" مطلقاً).
        - استبعد فوراً أي مرجع لا ينتمي لموضوع البحث!
-       - إذا كان عدد المراجع المطابقة أقل من (5 كتب، و6 أبحاث عربية/عراقية، و5 أبحاث أجنبية)، أكمل العدد فقط بأشهر الكتب والأبحاث الحقيقية المنشورة فعلياً في هذا التخصص الدقيق.
+       - إذا كان عدد المراجع المطابقة أقل من (5 كتب، و6 أبحاث عربية/عراقية، و5 أبحاث أجنبية)، إذا نقصت الكتب العربية فلا تختلق عنوان كتاب أو مؤلفاً من الذاكرة واكتفِ بالكتب الحقيقية الموثقة فقط.
     3. لا تضع نقطة في نهاية عناوين الأقسام أو الفروع في "sections_plan".
 
     أخرج كائن JSON بالحقول التالية حصراً:
@@ -989,12 +989,18 @@ def inspect_and_heal_full_report(order_info, intro_paras, imp_paras, method_para
                 new_items = []
                 for r_it in (t_obj.get("items") or []):
                     cur_id = next((idx_m for idx_m, tup in enumerate(flat_ref_map) if tup[2] == r_it), -1)
-                    if cur_id not in bad_ids:
+                    if (cur_id not in bad_ids) or (r_it in set(order_info.get("_used_ref_lines") or [])):
                         new_items.append(r_it)
                 if new_items:
                     t_obj["items"] = new_items
     except Exception as e:
         log_runtime_error("inspect_and_heal_full_report", e)
+    used_all_fn = set(order_info.get("_used_ref_lines") or [])
+    if used_all_fn and tiers:
+        in_tiers = {r for t_o in tiers for r in (t_o.get("items") or [])}
+        miss_fn = [u for u in used_all_fn if u not in in_tiers]
+        if miss_fn:
+            tiers[-1]["items"].extend(miss_fn)
     return conc_data
 
 def process_conversational_manager_edit(order_info, user_edit_text):
@@ -1088,7 +1094,7 @@ def _esc(val):
 
 def _pdf_esc(val):
     raw = str(val or "")
-    pattern = r'(\([A-Za-z0-9\-\s/,._+&]+\)|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9\-\s/]{2,}[A-Za-z0-9](?![A-Za-z0-9_]))'
+    pattern = r'(\([^)]*[A-Za-z][^)]*\)|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9\-\s/,._+]{1,}[A-Za-z0-9](?![A-Za-z0-9_]))'
     parts = re.split(pattern, raw)
     out = []
     for idx, part in enumerate(parts):
@@ -1096,7 +1102,7 @@ def _pdf_esc(val):
             continue
         esc_part = html.escape(part, quote=True)
         if idx % 2 == 1:
-            out.append(f'<span dir="ltr" style="unicode-bidi:isolate;">{esc_part}</span>')
+            out.append(f'<span dir="ltr" style="unicode-bidi:isolate; white-space:nowrap;">{esc_part}</span>')
         else:
             out.append(esc_part)
     return "".join(out)
@@ -1132,7 +1138,7 @@ def get_cover_graphics_html(category_code):
     cat = (category_code or "humanities").lower()
     if cat == "law":
         trio = """
-        <td style="width:33%; text-align:center;"><svg width="74" height="74" viewBox="0 0 120 120"><circle cx="38" cy="48" r="20" fill="none" stroke="#5A626A" stroke-width="6"/><circle cx="84" cy="74" r="20" fill="none" stroke="#5A626A" stroke-width="6"/><line x1="54" y1="58" x2="68" y2="66" stroke="#444" stroke-width="5" stroke-dasharray="4,3"/></svg></td>
+        <td style="width:33%; text-align:center;"><svg width="74" height="74" viewBox="0 0 120 120"><path d="M20 30 Q60 20 100 30 L100 90 Q60 80 20 90 Z" fill="#FAF6F0" stroke="#1B3B2B" stroke-width="3.5"/><line x1="60" y1="25" x2="60" y2="85" stroke="#B38F40" stroke-width="3"/></svg></td>
         <td style="width:34%; text-align:center;"><svg width="92" height="92" viewBox="0 0 140 140"><rect x="42" y="118" width="56" height="10" rx="3" fill="#5C3A21"/><line x1="70" y1="22" x2="70" y2="118" stroke="#B38F40" stroke-width="6"/><circle cx="70" cy="20" r="7" fill="#D4AF37"/><path d="M22 42 Q70 32 118 42" fill="none" stroke="#B38F40" stroke-width="5"/><line x1="26" y1="42" x2="14" y2="82" stroke="#8C6D1F" stroke-width="2"/><line x1="26" y1="42" x2="38" y2="82" stroke="#8C6D1F" stroke-width="2"/><path d="M10 82 Q26 96 42 82 Z" fill="#D4AF37"/><line x1="114" y1="42" x2="102" y2="82" stroke="#8C6D1F" stroke-width="2"/><line x1="114" y1="42" x2="126" y2="82" stroke="#8C6D1F" stroke-width="2"/><path d="M98 82 Q114 96 130 82 Z" fill="#D4AF37"/></svg></td>
         <td style="width:33%; text-align:center;"><svg width="76" height="76" viewBox="0 0 120 120"><rect x="12" y="84" width="52" height="11" rx="3" fill="#6E472B"/><g transform="rotate(-32 65 55)"><rect x="58" y="38" width="9" height="58" rx="3" fill="#8B5A2B"/><rect x="38" y="20" width="48" height="20" rx="5" fill="#5C3A21"/><rect x="56" y="20" width="12" height="20" fill="#D4AF37"/></g></svg></td>
         """
@@ -1473,6 +1479,7 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
     imp_paras = [clean_iraqi_text(p) for p in (intro_data.get("importance_paragraphs") or []) if p]
     method_paras = [clean_iraqi_text(p) for p in (intro_data.get("methodology_plan_paragraphs") or []) if p]
 
+    order_info["_used_ref_lines"] = []
     generated_mabahith = []
     global_footnotes = []
     used_ref_counts = {}
@@ -1528,10 +1535,15 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
 
                 raw_choice = ref_indices[p_i] if (isinstance(ref_indices, list) and p_i < len(ref_indices) and isinstance(ref_indices[p_i], int)) else p_i
                 chosen_idx = raw_choice % len(pool_objs)
-                if used_ref_counts.get(chosen_idx, 0) >= 2 and len(pool_objs) > 4:
-                    least_used = sorted(range(len(pool_objs)), key=lambda idx_k: used_ref_counts.get(idx_k, 0))
-                    chosen_idx = least_used[0]
-                used_ref_counts[chosen_idx] = used_ref_counts.get(chosen_idx, 0) + 1
+                years_in_para = [int(y) for y in re.findall(r'\b(20\d{2})\b', p_clean)]
+                max_para_yr = max(years_in_para) if years_in_para else 0
+                if max_para_yr >= 2015:
+                    ref_yrs = [int(y) for y in re.findall(r'\b((?:19|20)\d{2})\b', pool_objs[chosen_idx]["ref_line"])]
+                    if ref_yrs and ref_yrs[0] < max_para_yr:
+                        newer_c = [idx_k for idx_k, obj_k in enumerate(pool_objs) if any(int(ry) >= max_para_yr for ry in re.findall(r'\b((?:19|20)\d{2})\b', obj_k["ref_line"]))]
+                        if newer_c:
+                            chosen_idx = newer_c[p_i % len(newer_c)]
+                order_info.setdefault("_used_ref_lines", []).append(pool_objs[chosen_idx]["ref_line"])
 
                 fn_content = pool_objs[chosen_idx]["ref_line"]
                 global_footnotes.append(fn_content)
