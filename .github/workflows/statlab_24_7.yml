@@ -53,8 +53,8 @@ jobs:
           timeout 19200s python -u app.py || true
 
       - name: Auto-Respawn Next 24-7 Cycle
-        if: always()
+        if: success()
         env:
           GH_PAT: ${{ secrets.STATLAB_GH_TOKEN }}
         run: |
-          curl -s -X POST             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer ${GH_PAT}"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/statlab_24_7.yml/dispatches"             -d "{"ref":"${GITHUB_REF_NAME}"}" || true
+          curl -s -X POST             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer ${GH_PAT}"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/statlab_24_7.yml/dispatches"             -d '{"ref":"'"${GITHUB_REF_NAME}"'"}'}" || true
