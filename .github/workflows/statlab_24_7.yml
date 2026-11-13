@@ -1,0 +1,60 @@
+name: StatLab AI 24-7 Cloud Server
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths-ignore:
+      - "learned_lessons.json"
+      - "orders_cache.local"
+      - "allowed_users.json"
+      - "office_credits.json"
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: statlab-live-bot
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      STATLAB_GEMINI_KEYS: ${{ secrets.STATLAB_GEMINI_KEYS }}
+      STATLAB_BOT_TOKEN: ${{ secrets.STATLAB_BOT_TOKEN }}
+      STATLAB_GH_TOKEN: ${{ secrets.STATLAB_GH_TOKEN }}
+      STATLAB_ADMIN_ID: "8639396072"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Arabic Fonts & WeasyPrint System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-core fonts-hosny-amiri fonts-dejavu-core libreoffice-writer libpango-1.0-0 libpangoft2-1.0-0 libcairo2 shared-mime-info
+
+      - name: Install Python Packages
+        run: |
+          pip install -q -r requirements.txt
+
+      - name: Run StatLab AI Bot
+        run: |
+          timeout 19200s python -u app.py || true
+
+      - name: Auto-Respawn Next 24-7 Cycle
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.STATLAB_GH_TOKEN }}
+        run: |
+          curl -s -X POST             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer ${GH_PAT}"             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/statlab_24_7.yml/dispatches"             -d "{"ref":"${GITHUB_REF_NAME}"}" || true
