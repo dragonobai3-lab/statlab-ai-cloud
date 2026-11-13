@@ -33,7 +33,7 @@ except Exception:
 # ==============================================================================
 def _make_resilient_session():
     s = requests.Session()
-    retry = Retry(total=2, backoff_factor=0.4, status_forcelist=[502, 503, 504], allowed_methods=["GET", "POST"])
+    retry = Retry(total=2, backoff_factor=0.4, status_forcelist=[502, 504], allowed_methods=["GET", "POST"])
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
@@ -75,40 +75,38 @@ def get_current_academic_year():
     return f"{y} — {y + 1} م" if now.month >= 9 else f"{y - 1} — {y} م"
 
 def discover_gemini_models_and_keys():
-    pref_models = [
-        "gemini-3.8-flash",
-        "gemini-3.6-flash",
-        "gemini-2.5-flash",
+    candidates = [
+        "gemini-3-flash-preview",
         "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
-        "gemini-2.5-flash-lite"
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash"
     ]
-    working_keys = []
-    discovered_models = []
-    for k in GEMINI_KEYS:
+    working_keys = [k for k in GEMINI_KEYS if k]
+    if not working_keys:
+        return [], candidates[:3]
+    test_k = working_keys[0]
+    def _probe_model(m_name):
         try:
-            r = _HTTP_SESSION.get(
-                f"https://generativelanguage.googleapis.com/v1beta/models?key={k}",
-                headers={"x-goog-api-key": k},
-                timeout=8
-            )
+            u = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={test_k}"
+            r = requests.post(u, json={"contents": [{"parts": [{"text": "ok"}]}], "generationConfig": {"maxOutputTokens": 5}}, timeout=8)
             if r.status_code == 200:
-                working_keys.append(k)
-                if not discovered_models:
-                    avail = {m.get("name", "").replace("models/", "") for m in r.json().get("models", [])}
-                    for pm in pref_models:
-                        if pm in avail and pm not in discovered_models:
-                            discovered_models.append(pm)
-                    for am in sorted(avail, reverse=True):
-                        if ("flash" in am) and ("tts" not in am) and ("image" not in am) and ("audio" not in am) and (am not in discovered_models):
-                            discovered_models.append(am)
-            else:
-                working_keys.append(k)
+                return m_name
         except Exception:
-            working_keys.append(k)
-    final_keys = working_keys if working_keys else GEMINI_KEYS
-    final_models = discovered_models[:5] if discovered_models else pref_models[:4]
-    return final_keys, final_models
+            pass
+        return None
+    live_models = []
+    with ThreadPoolExecutor(max_workers=9) as ex:
+        for res_m in ex.map(_probe_model, candidates):
+            if res_m and res_m not in live_models:
+                live_models.append(res_m)
+    if not live_models:
+        live_models = ["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+    return working_keys, live_models
 
 WORKING_GEMINI_KEYS, ACTIVE_GEMINI_MODELS = discover_gemini_models_and_keys()
 
@@ -290,6 +288,8 @@ def cleanup_temp_files(*file_paths):
 # الوحدة (2): التطهير اللغوي واستخراج الـ JSON وإدارة طلبات Gemini + بحث Google الحي
 # ==============================================================================
 WORD_REPLACEMENTS = [
+    (r'إثناء\s+المكتبة', 'إثراء المكتبة'),
+    (r'لائحة\s+تنظيم\s+التجارة\s+الإلكترونية', 'نظام تنظيم التجارة الإلكترونية'),
     (r'المسائلة', 'المساءلة'),
     (r'مسائلة', 'مساءلة'),
     (r'كفائة', 'كفاءة'),
@@ -371,6 +371,7 @@ def clean_iraqi_text(txt, is_english=False, preserve_urls=False, is_reference=Fa
     txt = re.sub(r'\s*\[\d{1,3}\]\s*(?=[.،؛]?$)', '', txt)
     txt = txt.replace('\u200f', '').replace('\u200e', '')
     txt = strip_random_diacritics_keep_quran(txt)
+    txt = re.sub(r'(?<=[\u0621-\u064A])[A-Za-z](?=[\u0621-\u064A])', '', txt)
 
     if is_reference:
         for pat, rep in WORD_REPLACEMENTS:
@@ -400,7 +401,12 @@ def clean_iraqi_text(txt, is_english=False, preserve_urls=False, is_reference=Fa
 
 def format_reference_html_safe(ref_text, is_english_ref=False):
     cleaned = clean_iraqi_text(ref_text, is_english=is_english_ref, preserve_urls=is_english_ref, is_reference=True)
-    return html.escape(cleaned, quote=True)
+    en_cnt = len(re.findall(r'[a-zA-Z]', cleaned))
+    ar_cnt = len(re.findall(r'[\u0621-\u064A]', cleaned))
+    if is_english_ref or en_cnt > ar_cnt * 1.5:
+        return f'<span dir="ltr" style="unicode-bidi:isolate;">{html.escape(cleaned, quote=True)}</span>'
+    return _pdf_esc(cleaned)
+
 
 def extract_json_safely(raw_text):
     if not raw_text:
@@ -497,31 +503,41 @@ def ask_agent(prompt_text, agent_role="writer", json_mode=True, required_keys=No
 
     # التناوب على جميع المفاتيح الـ 8 في النموذج الأقوى أولاً قبل النزول للنموذج التالي
     for model_name in models_to_try:
+        model_overloaded = False
         for _ in range(num_keys):
             gem_key = get_next_gemini_key()
             if not gem_key:
                 break
             url_gem = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gem_key}"
-            hdrs_gem = {"Content-Type": "application/json", "x-goog-api-key": gem_key}
-
-            # محاولة أولى (مع أداة بحث Google إذا كانت مفعلة)
-            search_modes = [True, False] if use_google_search else [False]
-            for s_mode in search_modes:
-                gen_cfg = {"temperature": 0.25, "maxOutputTokens": 8192}
-                if json_mode and not s_mode:
-                    gen_cfg["responseMimeType"] = "application/json"
-                payload = {
-                    "systemInstruction": {"parts": [{"text": sys_msg}]},
-                    "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
-                    "generationConfig": gen_cfg
-                }
-                if s_mode:
-                    payload["tools"] = [{"google_search": {}}]
-
-                try:
-                    r_gem = _HTTP_SESSION.post(url_gem, json=payload, headers=hdrs_gem, timeout=45)
-                    if r_gem.status_code == 200:
-                        cands = r_gem.json().get("candidates") or []
+            hdrs_gem = {"Content-Type": "application/json"}
+            gen_cfg = {"temperature": 0.25, "maxOutputTokens": 8192}
+            if json_mode:
+                gen_cfg["responseMimeType"] = "application/json"
+            payload = {
+                "systemInstruction": {"parts": [{"text": sys_msg}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
+                "generationConfig": gen_cfg
+            }
+            try:
+                r_gem = _HTTP_SESSION.post(url_gem, json=payload, headers=hdrs_gem, timeout=65)
+                if r_gem.status_code == 200:
+                    cands = r_gem.json().get("candidates") or []
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts") or []
+                        txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text") and not p.get("thought")])
+                        if not txt_joined.strip():
+                            txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text")])
+                        txt = re.sub(r'<think>.*?</think>', '', txt_joined, flags=re.DOTALL).strip()
+                        if txt:
+                            last_non_empty = txt
+                        if _is_valid_output(txt):
+                            return txt
+                    break
+                elif r_gem.status_code == 400 and json_mode:
+                    payload["generationConfig"].pop("responseMimeType", None)
+                    r_retry = _HTTP_SESSION.post(url_gem, json=payload, headers=hdrs_gem, timeout=65)
+                    if r_retry.status_code == 200:
+                        cands = r_retry.json().get("candidates") or []
                         if cands:
                             parts = cands[0].get("content", {}).get("parts") or []
                             txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text")])
@@ -530,19 +546,20 @@ def ask_agent(prompt_text, agent_role="writer", json_mode=True, required_keys=No
                                 last_non_empty = txt
                             if _is_valid_output(txt):
                                 return txt
-                        break
-                    elif r_gem.status_code == 400 and s_mode:
-                        # إذا كان هذا النموذج الفرعي لا يدمج أداة البحث مع هذا الطلب، نعيد المحاولة فوراً بدون s_mode على نفس المفتاح
-                        continue
-                    elif r_gem.status_code == 429:
-                        # هذا المفتاح وصل لحد الدقيقة، ننتقل فوراً للمفتاح التالي على نفس النموذج الأقوى!
-                        time.sleep(0.3)
-                        break
-                    else:
-                        break
-                except Exception as e:
-                    log_runtime_error(f"Gemini {model_name}", e)
                     break
+                elif r_gem.status_code == 429:
+                    time.sleep(0.2)
+                    continue
+                elif r_gem.status_code in (404, 500, 503):
+                    model_overloaded = True
+                    break
+                else:
+                    break
+            except Exception as e:
+                log_runtime_error(f"Gemini {model_name}", e)
+                break
+        if model_overloaded:
+            continue
 
     if last_non_empty:
         return last_non_empty
@@ -575,34 +592,135 @@ def _convert_arabic_number_words(text):
         s = re.sub(pat, rep, s)
     return s
 
+def _harvest_real_database_candidates(ar_queries, en_queries):
+    """سحب الأبحاث والكتب الحقيقية الموثقة من OpenAlex و Crossref و Google Books"""
+    real_books_raw, real_papers_iq_ar, real_papers_en = [], [], []
+
+    def _task_gb(q):
+        if not q: return
+        try:
+            r = _HTTP_SESSION.get(f"https://www.googleapis.com/books/v1/volumes?q={requests.utils.quote(q)}&maxResults=6", timeout=8)
+            if r.status_code == 200:
+                for it in r.json().get("items", []):
+                    vi = it.get("volumeInfo", {})
+                    tit = (vi.get("title") or "").strip()
+                    auths = [a.strip() for a in (vi.get("authors") or []) if a.strip()]
+                    pub = (vi.get("publisher") or "").strip()
+                    yrs = re.findall(r'(?:19|20)\d{2}', str(vi.get("publishedDate") or ""))
+                    if tit and auths and yrs:
+                        pub_p = f"، {pub}" if pub else ""
+                        real_books_raw.append(f"{' و'.join(auths[:2])} ({yrs[0]})، «{tit}»{pub_p}.")
+        except Exception: pass
+
+    def _task_oa_iq(q_en):
+        if not q_en: return
+        try:
+            r = _HTTP_SESSION.get(f"https://api.openalex.org/works?filter=authorships.institutions.country_code:IQ&search={requests.utils.quote(q_en)}&per_page=10", timeout=9)
+            if r.status_code == 200:
+                for w in r.json().get("results", []):
+                    tit = (w.get("title") or "").strip()
+                    yr = w.get("publication_year")
+                    auths = [a.get("author", {}).get("display_name", "") for a in (w.get("authorships") or [])[:2] if a.get("author", {}).get("display_name")]
+                    inst_iq = next((inst["display_name"] for a in (w.get("authorships") or []) for inst in (a.get("institutions") or []) if inst.get("country_code") == "IQ" and inst.get("display_name")), "")
+                    jrn = (((w.get("primary_location") or {}).get("source") or {}).get("display_name") or "").strip()
+                    bib = w.get("biblio") or {}
+                    fp, lp = str(bib.get("first_page") or "").strip(), str(bib.get("last_page") or "").strip()
+                    pg = f"{fp}-{lp}" if (fp and lp and fp != lp) else fp
+                    if tit and yr and auths and (jrn or inst_iq):
+                        j_full = jrn if jrn else inst_iq
+                        pg_s = f"، ص {pg}" if pg else ""
+                        real_papers_iq_ar.append(f"{' و'.join(auths)} ({yr})، «{tit}»، {j_full}{pg_s}.")
+        except Exception: pass
+
+    def _task_cr(q_str, is_ar=True):
+        if not q_str: return
+        try:
+            r = _HTTP_SESSION.get(f"https://api.crossref.org/works?query={requests.utils.quote(q_str)}&rows=8", headers={"User-Agent": "StatLabAcademic/10.0"}, timeout=9)
+            if r.status_code == 200:
+                for it in r.json().get("message", {}).get("items", []):
+                    t_l = it.get("title") or []
+                    tit = t_l[0].strip() if t_l else ""
+                    auths = [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in (it.get("author") or [])[:2] if a.get("family")]
+                    yr_p = it.get("issued", {}).get("date-parts", [[]])
+                    yr = str(yr_p[0][0]) if (yr_p and yr_p[0] and yr_p[0][0]) else ""
+                    j_l = it.get("container-title") or []
+                    jrn = j_l[0].strip() if j_l else ""
+                    pg = str(it.get("page") or "").strip()
+                    if tit and auths and yr and jrn:
+                        if is_ar or re.search(r'[\u0621-\u064A]', tit):
+                            pg_s = f"، ص {pg}" if pg else ""
+                            real_papers_iq_ar.append(f"{' و'.join(auths)} ({yr})، «{tit}»، {jrn}{pg_s}.")
+                        else:
+                            pg_s = f", pp. {pg}" if pg else ""
+                            real_papers_en.append(f"{', '.join(auths)} ({yr}). {tit}. {jrn}{pg_s}.")
+        except Exception: pass
+
+    def _task_oa_en(q_en):
+        if not q_en: return
+        try:
+            r = _HTTP_SESSION.get(f"https://api.openalex.org/works?search={requests.utils.quote(q_en)}&filter=from_publication_date:2016-01-01,has_doi:true&per_page=10", timeout=9)
+            if r.status_code == 200:
+                for w in r.json().get("results", []):
+                    tit = (w.get("title") or "").strip()
+                    yr = w.get("publication_year")
+                    auths = [a.get("author", {}).get("display_name", "") for a in (w.get("authorships") or [])[:2] if a.get("author", {}).get("display_name")]
+                    jrn = (((w.get("primary_location") or {}).get("source") or {}).get("display_name") or "").strip()
+                    bib = w.get("biblio") or {}
+                    fp, lp = str(bib.get("first_page") or "").strip(), str(bib.get("last_page") or "").strip()
+                    pg = f"{fp}-{lp}" if (fp and lp and fp != lp) else fp
+                    if tit and yr and auths and jrn and "zenodo" not in jrn.lower():
+                        pg_s = f", pp. {pg}" if pg else ""
+                        real_papers_en.append(f"{', '.join(auths)} ({yr}). {tit}. {jrn}{pg_s}.")
+        except Exception: pass
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for aq in ar_queries[:2]:
+            ex.submit(_task_gb, aq)
+            ex.submit(_task_gb, " ".join(aq.split()[:3]))
+            ex.submit(_task_cr, aq, True)
+        for eq in en_queries[:2]:
+            ex.submit(_task_oa_iq, eq)
+            ex.submit(_task_oa_en, eq)
+            ex.submit(_task_cr, eq, False)
+
+    return real_books_raw[:10], real_papers_iq_ar[:14], real_papers_en[:12]
+
 def parse_and_calibrate_order(raw_user_text):
-    """
-    البحث الحي الطبيعي عبر Google Search المدمج في Gemini 3.8 Flash:
-    1. يفهم العنوان والتخصص والكلية وشروط الطالب.
-    2. يبحث حياً في Google والباحث العلمي والمجلات العراقية (iasj.rdd.edu.iq) عن الأبحاث والكتب المنشورة والمقبولة في هذا الموضوع بالذات.
-    3. يتعلم منهجيتها ويبني الخطة والمصادر الحقيقية المطابقة للموضوع 100%.
-    """
     normalized_input = _convert_arabic_number_words(raw_user_text)
     default_acad_yr = get_current_academic_year()
+
+    q_extract_prompt = f"""
+    لطلب البحث التالي: «{normalized_input}»
+    أخرج كائن JSON يحتوي على:
+    - "ar_queries": عبارتي بحث أكاديميتين بالعربية في صلب الموضوع (بدون اسم الجامعة أو الكلية).
+    - "en_queries": عبارتي بحث أكاديميتين بالإنجليزية تطابقان الموضوع بدقة.
+    {{"ar_queries": ["عبارة عربية 1", "عبارة عربية 2"], "en_queries": ["english query 1", "english query 2"]}}
+    """
+    q_info = extract_json_safely(ask_agent(q_extract_prompt, "scout", True, required_keys=["ar_queries", "en_queries"]))
+    ar_qs = q_info.get("ar_queries") or [normalized_input[:55]]
+    en_qs = q_info.get("en_queries") or [normalized_input[:55]]
+
+    db_books, db_papers_ar, db_papers_en = _harvest_real_database_candidates(ar_qs, en_qs)
+    db_evidence_block = (
+        "[الكتب المسحوبة من Google Books]:\n" + ("\n".join([f"- {x}" for x in db_books]) if db_books else "لا يوجد") +
+        "\n\n[الأبحاث العراقية والعربية المسحوبة من OpenAlex IQ & Crossref]:\n" + ("\n".join([f"- {x}" for x in db_papers_ar]) if db_papers_ar else "لا يوجد") +
+        "\n\n[الأبحاث الأجنبية المسحوبة من OpenAlex & Crossref]:\n" + ("\n".join([f"- {x}" for x in db_papers_en]) if db_papers_en else "لا يوجد")
+    )
 
     calib_prompt = f"""
     رسالة وطلب الباحث:
     «{normalized_input}»
 
-    قم الآن بالبحث الحي في محرك بحث Google والباحث العلمي (Google Scholar) والمجلات الأكاديمية العراقية (iasj.rdd.edu.iq) عن الأبحاث والدراسات والكتب المنشورة والمقبولة فعلياً في هذا الموضوع الدقيق، ثم أخرج كائن JSON شامل يحتوي على:
-    1. العنوان الأكاديمي الصافي ("clean_title") بعد فصل الشروط، مع وضع أي اختصار إنجليزي في مكانه الصحيح بعد مصطلحه العربي مباشرة.
-    2. التخصص الدقيق ("specialty")، واسم الكلية ("college_name")، واسم الجامعة ("university_name")، وفئة الغلاف ("category_code": اختر من "law" أو "economics" أو "medical" أو "engineering" أو "humanities").
-    3. هل التخصص شرعي/فقهي/أدبي عربي خالص يمنع المراجع الإنجليزية ("is_arabic_doctrinal_only": true/false)؟
-    4. المتغير المستقل ("independent_var") والمتغير التابع ("dependent_var") للتحليل الإحصائي.
-    5. البصمة المنهجية الحية ("live_methodology_blueprint"): كيف تكتب الأبحاث المنشورة المقبولة في هذا الموضوع؟ ما المنهج العلمي المتبع؟ وما المصطلحات أو المعادلات أو النصوص القياسية الواجب ذكرها؟
-    6. هيكل التقسيم الأكاديمي ("sections_plan"):
-       - إذا كان التخصص في (القانون، الشريعة، الإدارة والاقتصاد، العلوم السياسية، العلوم الإنسانية) أو طلب المستخدم كلمة "مباحث ومطالب"، استخدم ("المبحث الأول: ..." وتحته "المطلب الأول: ...", "المطلب الثاني: ...").
-       - إذا كان التخصص في (الطب، الهندسة، علوم الحاسوب، العلوم الصرفة) ولم يطلب المستخدم كلمة "مباحث"، استخدم ("المحور الأول: ..." وتحته "أولاً: ...", "ثانياً: ...").
-    7. المصادر الحقيقية الموثقة المطابقة للموضوع 100% (يُمنع منعاً باتاً إدراج أي مصدر من تخصص آخر أو موضوع عام كطرق البحث العلمي!):
-       - "references_books": قائمة من 5 كتب مرجعية عربية حقيقية مطبوعة في صلب هذا الموضوع الدقيق بصيغة: "اسم المؤلف (السنة)، «عنوان الكتاب»، دار النشر، مدينة النشر."
-       - "references_ar": قائمة من 6 أبحاث ودراسات أكاديمية عراقية وعربية محكمة منشورة فعلياً في المجلات العلمية في صلب هذا الموضوع الدقيق بصيغة: "اسم الباحث (السنة)، «عنوان البحث»، اسم المجلة، الجامعة، ص من-إلى."
-       - "references_en": قائمة من 5 أبحاث أجنبية محكمة منشورة في مجلات عالمية (IEEE / Elsevier / Springer / PubMed / إلخ) في صلب هذا الموضوع الدقيق بصيغة APA الكاملة باللغة الإنجليزية.
-    8. جدول المقارنة التحليلي ("comparison_table") المناسب لصلب الموضوع.
+    أمامك القائمة الحقيقية للمراجع والأبحاث المسحوبة الآن من قواعد البيانات العالمية (OpenAlex & Crossref & Google Books):
+    {db_evidence_block}
+
+    التعليمات الصارمة:
+    1. استخرج العنوان الأكاديمي الصافي ("clean_title") والتخصص ("specialty") والكلية ("college_name") والجامعة ("university_name") وفئة الغلاف ("category_code": "law" أو "economics" أو "medical" أو "engineering" أو "humanities").
+    2. في حقول المراجع ("references_books", "references_ar", "references_en"):
+       - انتقِ أولاً كل مرجع من القائمة المسحوبة أعلاه يطابق موضوع البحث وتخصصه فعلياً (مع الاحتفاظ باسم المؤلف الحقيقي والسنة والمجلة وأرقام الصفحات، وتعريب عنوان البحث العراقي المكتوب بالإنجليزية إلى العربية الفصحى في "references_ar").
+       - استبعد فوراً أي مرجع لا ينتمي لموضوع البحث!
+       - إذا كان عدد المراجع المطابقة أقل من (5 كتب، و6 أبحاث عربية/عراقية، و5 أبحاث أجنبية)، أكمل العدد فقط بأشهر الكتب والأبحاث الحقيقية المنشورة فعلياً في هذا التخصص الدقيق.
+    3. لا تضع نقطة في نهاية عناوين الأقسام أو الفروع في "sections_plan".
 
     أخرج كائن JSON بالحقول التالية حصراً:
     {{
@@ -619,48 +737,28 @@ def parse_and_calibrate_order(raw_user_text):
       "student_name": "........................................",
       "supervisor_name": "........................................",
       "academic_year": "{default_acad_yr}",
-      "user_ forced_mabahith": false,
+      "user_forced_mabahith": false,
       "custom_instructions": "",
-      "live_methodology_blueprint": "شرح مكثف للمنهجية العلمية والأسلوب الأكاديمي والمصطلحات القياسية المستخرجة من الأبحاث المنشورة في هذا الموضوع",
+      "live_methodology_blueprint": "شرح مكثف للمنهجية العلمية والمصطلحات القياسية المعتمدة في هذا الموضوع",
       "sections_plan": [
-        {{
-          "section_title": "المبحث الأول (أو المحور الأول): ...",
-          "sub_sections": ["المطلب الأول (أو أولاً): ...", "المطلب الثاني (أو ثانياً): ..."]
-        }},
-        {{
-          "section_title": "المبحث الثاني (أو المحور الثاني): ...",
-          "sub_sections": ["المطلب الأول (أو أولاً): ...", "المطلب الثاني (أو ثانياً): ..."]
-        }},
-        {{
-          "section_title": "المبحث الثالث (أو المحور الثالث): ...",
-          "sub_sections": ["المطلب الأول (أو أولاً): ...", "المطلب الثاني (أو ثانياً): ..."]
-        }}
+        {{"section_title": "المبحث الأول (أو المحور الأول): ...", "sub_sections": ["المطلب الأول (أو أولاً): ...", "المطلب الثاني (أو ثانياً): ..."]}},
+        {{"section_title": "المبحث الثاني (أو المحور الثاني): ...", "sub_sections": ["المطلب الأول (أو أولاً): ...", "المطلب الثاني (أو ثانياً): ..."]}},
+        {{"section_title": "المبحث الثالث (أو المحور الثالث): ...", "sub_sections": ["المطلب الأول (أو أولاً): ...", "المطلب الثاني (أو ثانياً): ..."]}}
       ],
-      "references_books": [
-        "المؤلف (السنة)، «عنوان الكتاب المتخصص في صلب الموضوع»، دار النشر، المدينة."
-      ],
-      "references_ar": [
-        "الباحث (السنة)، «عنوان البحث العراقي/العربي المنشور في صلب الموضوع»، اسم المجلة، الجامعة، ص 10-35."
-      ],
-      "references_en": [
-        "Author, A. (Year). Exact Title of Published Paper on Topic. Journal Name, pp. 1-15."
-      ],
+      "references_books": ["المؤلف (السنة)، «عنوان الكتاب الحقيقي»، دار النشر، المدينة."],
+      "references_ar": ["الباحث (السنة)، «عنوان البحث الحقيقي»، اسم المجلة، ص من-إلى."],
+      "references_en": ["Author, A. (Year). Exact Title of Published Paper. Journal Name, pp. 1-15."],
       "include_comparison_table": true,
       "comparison_table": {{
         "title": "جدول المقارنة التحليلية لمحاور الدراسة",
         "col1_header": "وجه المقارنة",
         "col2_header": "المحور أو الاتجاه الأول",
         "col3_header": "المحور أو الاتجاه الثاني",
-        "rows": [
-          ["الأساس العلمي والمنهجي", "...", "..."],
-          ["الركائز والآليات الحاكمة", "...", "..."],
-          ["نطاق التطبيق والأثر", "...", "..."],
-          ["الضمانات ومخرجات الأداء", "...", "..."]
-        ]
+        "rows": [["الأساس العلمي والمنهجي", "...", "..."], ["الركائز والآليات الحاكمة", "...", "..."], ["نطاق التطبيق والأثر", "...", "..."], ["الضمانات ومخرجات الأداء", "...", "..."]]
       }}
     }}
     """
-    calib_data = extract_json_safely(ask_agent(calib_prompt, "calibrator", True, required_keys=["clean_title", "sections_plan"], use_google_search=True))
+    calib_data = extract_json_safely(ask_agent(calib_prompt, "calibrator", True, required_keys=["clean_title", "sections_plan"]))
 
     clean_title = clean_iraqi_text(calib_data.get("clean_title") or raw_user_text[:95])
     specialty = clean_iraqi_text(calib_data.get("specialty") or "الدراسات الأكاديمية")
@@ -689,7 +787,7 @@ def parse_and_calibrate_order(raw_user_text):
             s_title = clean_iraqi_text(sec_item.get("section_title") or sec_item.get("mabhath_title") or "")
             s_title = re.sub(r'^(?:المبحث|المحور|الفصل|القسم)\s+(?:الأول|الثاني|الثالث|الرابع|الخامس|\d+)\s*[:：\-]?\s*', '', s_title).strip()
             prefix_sec = f"المبحث {ord_w}" if use_mabahith_labels else f"المحور {ord_w}"
-            s_title = f"{prefix_sec}: {s_title}"
+            s_title = f"{prefix_sec}: {s_title.rstrip('.،؛')}"
 
             subs_raw = sec_item.get("sub_sections") or sec_item.get("matalib") or []
             subs_clean = []
@@ -702,7 +800,7 @@ def parse_and_calibrate_order(raw_user_text):
                 else:
                     ord_adv = ["أولاً", "ثانياً", "ثالثاً", "رابعاً"][min(sub_idx - 1, 3)]
                     sub_c = f"{ord_adv}: {sub_c}"
-                subs_clean.append(sub_c)
+                subs_clean.append(sub_c.rstrip(".،؛"))
             if subs_clean:
                 plan.append({"mabhath_title": s_title, "matalib": subs_clean})
 
@@ -736,14 +834,50 @@ def parse_and_calibrate_order(raw_user_text):
     verified_source_objects = []
 
     def _extract_cite_tag(ref_line, is_en=False):
-        auth_part = ref_line.split("(")[0].strip(" .،,-•")
+        auth_part = ref_line.split("(")[0].strip(" .،,-•–—")
         yr_m = re.findall(r'(?:19|20)\d{2}', ref_line)
         yr_str = yr_m[0] if yr_m else "2024"
-        words_a = [w.strip(".,،؛:") for w in auth_part.split() if len(w.strip(".,،؛:")) >= 2]
-        surname = words_a[0] if words_a else ("Author" if is_en else "الباحث")
-        if not is_en and ("،" in auth_part or " و" in auth_part):
-            surname = auth_part[:35].strip(" ،,")
-        return f"{surname}, {yr_str}" if is_en else f"{surname}، {yr_str}"
+        if is_en or (len(re.findall(r'[a-zA-Z]', auth_part)) > len(re.findall(r'[\u0621-\u064A]', auth_part))):
+            has_et_al = "et al" in auth_part.lower()
+            clean_a = re.sub(r'\bet\s+al\.?', '', auth_part, flags=re.IGNORECASE).strip(" ,.")
+            m_apa = re.match(r'^([A-Za-z\'\-]+),\s*[A-Z]\.', clean_a)
+            if m_apa:
+                surn = m_apa.group(1)
+                return f"{surn} et al., {yr_str}" if has_et_al else f"{surn}, {yr_str}"
+            auths_en = [x.strip(" ,.") for x in re.split(r'\s*&\s*|\s+and\s+|,\s*|;', clean_a) if len(x.strip(" ,.")) >= 2]
+            surns = []
+            for a_item in auths_en[:2]:
+                toks = [t.strip(".,") for t in a_item.split() if len(t.strip(".,")) >= 2]
+                if toks:
+                    surns.append(toks[-1])
+            s_final = " & ".join(surns) if surns else "Author"
+            return f"{s_final} et al., {yr_str}" if has_et_al and len(surns) == 1 else f"{s_final}, {yr_str}"
+        else:
+            clean_ar = re.sub(r'(?:^|\s)(?:أ\.د\.|أ\.م\.د\.|م\.د\.|د\.|أ\.|الدكتور|الأستاذ|الباحث)(?=\s|$)', ' ', auth_part).strip(" .،,")
+            clean_ar = re.sub(r'\s{2,}', ' ', clean_ar)
+            has_others = "آخرون" in clean_ar
+            clean_ar = clean_ar.replace("وآخرون", "").strip(" .،,")
+            m_sur_first = re.match(r'^([^\s،]+)\s*،\s*([^\s،]+(?:\s+[^\s،]+){0,3})$', clean_ar)
+            if m_sur_first and " و" not in clean_ar:
+                surn_only = m_sur_first.group(1).strip()
+                return f"{surn_only}، {yr_str}"
+            auths_ar = [x.strip(" .،,") for x in re.split(r'\s*،\s*|\s*؛\s*|\s+و(?=[\u0621-\u064A]{2,})', clean_ar) if len(x.strip(" .،,")) >= 2]
+            surns_ar = []
+            for a_item in auths_ar[:2]:
+                toks = [t for t in a_item.split() if len(t) >= 2]
+                if len(toks) >= 2 and toks[-2] in ("عبد", "أبو", "ابو", "بن", "آل", "ذو"):
+                    surns_ar.append(f"{toks[-2]} {toks[-1]}")
+                elif toks:
+                    surns_ar.append(toks[-1])
+            s_final = " وآخرون" if (has_others and len(surns_ar) == 1) else ""
+            base_s = " و".join(surns_ar) if surns_ar else "الباحث"
+            return f"{base_s}{s_final}، {yr_str}"
+
+    en_books_cnt = sum(1 for b in books_list if len(re.findall(r'[a-zA-Z]', b)) > len(re.findall(r'[\u0621-\u064A]', b)))
+    for t_o in formatted_tiers:
+        if "الكتب" in t_o.get("title", "") and books_list and en_books_cnt > (len(books_list) / 2):
+            t_o["is_ltr"] = True
+
 
     for b_line in books_list:
         c_tag = _extract_cite_tag(b_line, is_en=False)
@@ -796,21 +930,20 @@ def parse_and_calibrate_order(raw_user_text):
     }
 
 def inspect_and_heal_full_report(order_info, intro_paras, imp_paras, method_paras, generated_mabahith, conc_data):
-    """
-    المدقق الشامل للتقرير الكامل (يرى التقرير كاملاً من الغلاف والفهرس والمتن حتى قائمة المصادر والهوامش تماماً كما تفحصه في الدردشة!):
-    يكشف أي مصدر غير مطابق للموضوع أو أي تناقض أو خطأ علمي ويصلحه قبل الطباعة.
-    """
+    """المدقق الشامل: يصحح الاستنتاجات والتوصيات ويكتشف أرقام المراجع الدخيلة لحذفها دون تغيير أسماء المجلات أو الصفحات الحقيقية."""
     title_ar = order_info["clean_title"]
     specialty = order_info["specialty"]
     calib = order_info["calib"]
     tiers = calib.get("formatted_reference_tiers") or []
 
-    all_refs_preview = []
-    for t_obj in tiers:
-        all_refs_preview.append(f"[{t_obj.get('title')}]:")
-        for r_idx, r_it in enumerate(t_obj.get("items") or [], 1):
-            all_refs_preview.append(f"  {r_idx}. {r_it}")
-    refs_dump = "\n".join(all_refs_preview)
+    indexed_refs = []
+    flat_ref_map = []
+    for t_idx, t_obj in enumerate(tiers):
+        for r_idx, r_it in enumerate(t_obj.get("items") or []):
+            flat_id = len(flat_ref_map)
+            flat_ref_map.append((t_idx, r_idx, r_it))
+            indexed_refs.append(f"[{flat_id}] {r_it}")
+    refs_dump = "\n".join(indexed_refs)
 
     sections_dump = []
     for mb in generated_mabahith:
@@ -820,58 +953,41 @@ def inspect_and_heal_full_report(order_info, intro_paras, imp_paras, method_para
     sec_summary = "\n".join(sections_dump)
 
     audit_prompt = f"""
-    أنت الآن المدقق الأكاديمي الأعلى (Gemini 3.8 Flash). أمامك المسودة الكاملة للتقرير قبل تحويله إلى PDF و Word:
-    - العنوان: «{title_ar}»
-    - التخصص والكلية: {specialty} — {order_info['college_name']} ({order_info['university_name']})
-    - شروط الطالب الخاصة: {order_info.get('custom_instructions') or 'التزام الدقة العلمية والتخصصية'}
-
-    [ملخص أقسام ومباحث التقرير المكتوبة]:
+    أنت المدقق الأكاديمي الأعلى. أمامك مسودة البحث الكاملة قبل الطباعة:
+    - العنوان: «{title_ar}» — التخصص: «{specialty}»
+    [ملخص الأقسام]:
     {sec_summary}
-
-    [الاستنتاجات المكتوبة]:
-    {json.dumps(conc_data.get('findings') or [], ensure_ascii=False)}
-
-    [التوصيات المكتوبة]:
-    {json.dumps(conc_data.get('recommendations') or [], ensure_ascii=False)}
-
-    [قائمة المصادر والمراجع المدرجة في نهاية التقرير]:
+    [الاستنتاجات]: {json.dumps(conc_data.get('findings') or [], ensure_ascii=False)}
+    [التوصيات]: {json.dumps(conc_data.get('recommendations') or [], ensure_ascii=False)}
+    [المراجع المرقمة]:
     {refs_dump}
 
-    افحص هذا التقرير كاملاً بعين ناقدة صارمة (استخدم بحث Google للتحقق عند الحاجة):
-    1. افحص كل مرجع في [قائمة المصادر والمراجع]: هل هناك أي مرجع دخيل لا ينتمي لموضوع «{title_ar}» وتخصص «{specialty}» (مثل كتاب عام في مناهج البحث أو بحث من تخصص آخر)؟ إذا وجدت أي مرجع دخيل، استبدله فوراً بمرجع حقيقي موثوق في صلب «{title_ar}»!
-    2. افحص الاستنتاجات والتوصيات: هل هي دقيقة علمياً ومرتبطة 100% بمباحث التقرير؟ صوّب أي خطأ علمي أو لغوي فيها.
-
-    أخرج كائن JSON بالحقول المصححة التالية:
+    المطلوب:
+    1. راجع الاستنتاجات والتوصيات وأخرجها مصححة لغوياً وعلمياً في "healed_findings" و"healed_recommendations".
+    2. افحص المراجع المرقمة من [0] إلى [{max(0, len(flat_ref_map)-1)}]: إذا وجدت مرجعاً دخيلاً لا ينتمي لموضوع «{title_ar}»، ضع رقمه فقط في "bad_ref_indices" (ولا تضع أي رقم لمرجع صحيح!).
+    أخرج JSON:
     {{
-      "healed_findings": ["الاستنتاج 1 المصحح...", "الاستنتاج 2...", "الاستنتاج 3...", "الاستنتاج 4...", "الاستنتاج 5..."],
-      "healed_recommendations": ["التوصية 1 المصححة...", "التوصية 2...", "التوصية 3...", "التوصية 4...", "التوصية 5..."],
-      "healed_books": ["قائمة الكتب المرجعية بعد تطهير أي كتاب غير متخصص..."],
-      "healed_ar_refs": ["قائمة الأبحاث العراقية/العربية المحكمة بعد تطهير أي بحث دخيل..."],
-      "healed_en_refs": ["قائمة الأبحاث الأجنبية المحكمة بعد تطهير أي بحث دخيل..."]
+      "healed_findings": ["..."],
+      "healed_recommendations": ["..."],
+      "bad_ref_indices": []
     }}
     """
     try:
-        res = extract_json_safely(ask_agent(audit_prompt, "auditor", True, required_keys=["healed_findings", "healed_recommendations"], use_google_search=True))
+        res = extract_json_safely(ask_agent(audit_prompt, "auditor", True, required_keys=["healed_findings", "healed_recommendations"]))
         if res.get("healed_findings") and len(res["healed_findings"]) >= 3:
             conc_data["findings"] = [clean_iraqi_text(x) for x in res["healed_findings"]]
         if res.get("healed_recommendations") and len(res["healed_recommendations"]) >= 3:
             conc_data["recommendations"] = [clean_iraqi_text(x) for x in res["healed_recommendations"]]
-
-        new_books = [clean_iraqi_text(x, is_reference=True) for x in (res.get("healed_books") or []) if len(str(x).strip()) > 12]
-        new_ar = [clean_iraqi_text(x, is_reference=True) for x in (res.get("healed_ar_refs") or []) if len(str(x).strip()) > 12]
-        new_en = [] if order_info.get("is_doctrinal") else [clean_iraqi_text(x, is_english=True, preserve_urls=True, is_reference=True) for x in (res.get("healed_en_refs") or []) if len(str(x).strip()) > 12]
-
-        if new_books or new_ar:
-            ords = ["أولاً", "ثانياً", "ثالثاً"]
-            new_tiers = []
-            if new_books:
-                new_tiers.append({"title": f"{ords[len(new_tiers)]} — الكتب والمؤلفات الأكاديمية المعتمدة", "items": new_books, "is_ltr": False})
-            if new_ar:
-                new_tiers.append({"title": f"{ords[len(new_tiers)]} — الأبحاث والدراسات المنشورة في الدوريات والمجلات العلمية المحكمة", "items": new_ar, "is_ltr": False})
-            if new_en:
-                new_tiers.append({"title": f"{ords[len(new_tiers)]} — المصادر والدوريات الأجنبية المحكمة (Foreign References)", "items": new_en, "is_ltr": True})
-            if new_tiers:
-                calib["formatted_reference_tiers"] = new_tiers
+        bad_ids = {int(x) for x in (res.get("bad_ref_indices") or []) if isinstance(x, int) or str(x).isdigit()}
+        if bad_ids and len(bad_ids) < len(flat_ref_map):
+            for t_obj in tiers:
+                new_items = []
+                for r_it in (t_obj.get("items") or []):
+                    cur_id = next((idx_m for idx_m, tup in enumerate(flat_ref_map) if tup[2] == r_it), -1)
+                    if cur_id not in bad_ids:
+                        new_items.append(r_it)
+                if new_items:
+                    t_obj["items"] = new_items
     except Exception as e:
         log_runtime_error("inspect_and_heal_full_report", e)
     return conc_data
@@ -964,6 +1080,21 @@ def process_conversational_manager_edit(order_info, user_edit_text):
 # ==============================================================================
 def _esc(val):
     return html.escape(str(val or ""), quote=True)
+
+def _pdf_esc(val):
+    raw = str(val or "")
+    pattern = r'(\([A-Za-z0-9\-\s/,._+&]+\)|(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9\-\s/]{2,}[A-Za-z0-9](?![A-Za-z0-9_]))'
+    parts = re.split(pattern, raw)
+    out = []
+    for idx, part in enumerate(parts):
+        if not part:
+            continue
+        esc_part = html.escape(part, quote=True)
+        if idx % 2 == 1:
+            out.append(f'<span dir="ltr" style="unicode-bidi:isolate;">{esc_part}</span>')
+        else:
+            out.append(esc_part)
+    return "".join(out)
 
 def get_cover_graphics_html(category_code):
     top_logos_bar = """
@@ -1134,7 +1265,7 @@ def setup_iraqi_document(is_english=False, header_title=""):
         if header_title:
             hdr = section.header.paragraphs[0]
             hdr.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            rh = hdr.add_run(truncate_title_by_words(clean_iraqi_text(header_title), 65))
+            rh = hdr.add_run(truncate_title_by_words(clean_iraqi_text(header_title), 85))
             rh.font.name = "Arial"
             rh.font.size = Pt(9.5)
             rh.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
@@ -1214,6 +1345,31 @@ def add_banner_heading(doc, text, size=15, is_english=False, outline_lvl=0, page
 def style_zebra_table(tbl, is_english=False, col_widths_cm=None, text_col_idx=None):
     tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
     tbl.autofit = False
+    dxa_list = None
+    if col_widths_cm:
+        total_w = sum(col_widths_cm)
+        if total_w > 15.5:
+            scale = 15.5 / total_w
+            col_widths_cm = [round(w * scale, 2) for w in col_widths_cm]
+        dxa_list = [int(round(w * 567)) for w in col_widths_cm]
+        total_dxa = sum(dxa_list)
+        tblPr = tbl._tbl.tblPr
+        old_tblW = tblPr.find(qn('w:tblW'))
+        if old_tblW is not None:
+            tblPr.remove(old_tblW)
+        tblPr.append(parse_xml(f'<w:tblW {nsdecls("w")} w:w="{total_dxa}" w:type="dxa"/>'))
+        old_layout = tblPr.find(qn('w:tblLayout'))
+        if old_layout is not None:
+            tblPr.remove(old_layout)
+        tblPr.append(parse_xml(f'<w:tblLayout {nsdecls("w")} w:type="fixed"/>'))
+        old_grid = tbl._tbl.find(qn('w:tblGrid'))
+        if old_grid is not None:
+            tbl._tbl.remove(old_grid)
+        new_grid = OxmlElement('w:tblGrid')
+        for dxa_v in dxa_list:
+            new_grid.append(parse_xml(f'<w:gridCol {nsdecls("w")} w:w="{dxa_v}"/>'))
+        tblPr.addnext(new_grid)
+
     for r_idx, row in enumerate(tbl.rows):
         trPr = row._tr.get_or_add_trPr()
         if trPr.find(qn('w:cantSplit')) is None:
@@ -1221,10 +1377,14 @@ def style_zebra_table(tbl, is_english=False, col_widths_cm=None, text_col_idx=No
         if r_idx == 0 and trPr.find(qn('w:tblHeader')) is None:
             trPr.append(OxmlElement('w:tblHeader'))
         for c_idx, cell in enumerate(row.cells):
-            if col_widths_cm and c_idx < len(col_widths_cm):
-                cell.width = Cm(col_widths_cm[c_idx])
-            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             tcPr = cell._tc.get_or_add_tcPr()
+            if dxa_list and c_idx < len(dxa_list):
+                cell.width = Cm(col_widths_cm[c_idx])
+                old_tcW = tcPr.find(qn('w:tcW'))
+                if old_tcW is not None:
+                    tcPr.remove(old_tcW)
+                tcPr.insert(0, parse_xml(f'<w:tcW {nsdecls("w")} w:w="{dxa_list[c_idx]}" w:type="dxa"/>'))
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             fill_hex = "1F4E78" if r_idx == 0 else ("F2F6FC" if r_idx % 2 == 1 else "FFFFFF")
             old_shd = tcPr.find(qn('w:shd'))
             if old_shd is not None:
@@ -1337,7 +1497,8 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
             التعليمات الإلزامية:
             1. اكتب ({paras_per_sub}) فقرات علمية تحليلية عميقة ومفصلة تشرح «{mt_title}» مباشرة وبأسلوب أكاديمي عراقي رصين.
             2. لا تضع أي أرقام مربعة مثل [0] أو [REF_0] داخل نص الفقرة، بل ضع أرقام المراجع في حقل "cited_ref_indices" فقط.
-            3. نوّع مطالع الفقرات ولا تبدأ فقرتين متتاليتين بـ (تُعدّ / يُعدّ).
+            3. نوّع مطالع الفقرات ولا تكرر نفس الجمل الاستهلالية (وتأسيساً على ذلك، وعند موازنة هذه المعطيات، ينطلق التأصيل).
+            4. التسمية القانونية العراقية الرسمية هي (نظام) وليس (لائحة)، واذكر أرقام المواد القانونية الموثقة متى توفرت.
 
             أخرج كائن JSON بالحقول التالية:
             {{
@@ -1374,7 +1535,7 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
 
                 p_docx_final = f"{p_clean} ({fn_num})."
                 fn_safe_html = format_reference_html_safe(fn_content, is_english_ref=False)
-                p_html_final = f'{_esc(p_clean)}<sup class="fn-ref">({fn_num})</sup><span class="fn-call">{fn_safe_html}</span>.'
+                p_html_final = f'{_pdf_esc(p_clean)}<sup class="fn-ref">({fn_num})</sup><span class="fn-call">{fn_safe_html}</span>.'
                 processed_paras_html.append(p_html_final)
                 processed_paras_docx.append(p_docx_final)
 
@@ -1419,10 +1580,10 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
     )
     for mb in generated_mabahith:
         m_id = f"sec-mb-{mb['m_idx']}"
-        toc_rows_html += f'<tr class="toc-main-row"><td class="toc-td-title"><a class="toc-a" href="#{m_id}">{_esc(mb["m_title"])}</a></td><td class="toc-td-pg"><a class="toc-pg-a" href="#{m_id}"></a></td></tr>'
+        toc_rows_html += f'<tr class="toc-main-row"><td class="toc-td-title"><a class="toc-a" href="#{m_id}">{_pdf_esc(mb["m_title"])}</a></td><td class="toc-td-pg"><a class="toc-pg-a" href="#{m_id}"></a></td></tr>'
         for mt_i, mt in enumerate(mb["matalib"], 1):
             mt_id = f"sec-mb-{mb['m_idx']}-mt-{mt_i}"
-            toc_rows_html += f'<tr class="toc-sub-row"><td class="toc-td-title"><a class="toc-a" href="#{mt_id}">{_esc(mt["mt_title"])}</a></td><td class="toc-td-pg"><a class="toc-pg-a" href="#{mt_id}"></a></td></tr>'
+            toc_rows_html += f'<tr class="toc-sub-row"><td class="toc-td-title"><a class="toc-a" href="#{mt_id}">{_pdf_esc(mt["mt_title"])}</a></td><td class="toc-td-pg"><a class="toc-pg-a" href="#{mt_id}"></a></td></tr>'
     toc_rows_html += (
         '<tr class="toc-main-row"><td class="toc-td-title"><a class="toc-a" href="#sec-conc">الخاتمة: الاستنتاجات والتوصيات</a></td><td class="toc-td-pg"><a class="toc-pg-a" href="#sec-conc"></a></td></tr>'
         '<tr class="toc-main-row"><td class="toc-td-title"><a class="toc-a" href="#sec-refs">قائمة المصادر والمراجع</a></td><td class="toc-td-pg"><a class="toc-pg-a" href="#sec-refs"></a></td></tr>'
@@ -1440,24 +1601,24 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
         c_rows_h = ""
         for r_row in comp_rows:
             if isinstance(r_row, list) and len(r_row) >= 3:
-                c_rows_h += f'<tr><td class="td-key">{_esc(clean_iraqi_text(r_row[0]))}</td><td>{_esc(clean_iraqi_text(r_row[1]))}</td><td>{_esc(clean_iraqi_text(r_row[2]))}</td></tr>'
+                c_rows_h += f'<tr><td class="td-key">{_pdf_esc(clean_iraqi_text(r_row[0]))}</td><td>{_pdf_esc(clean_iraqi_text(r_row[1]))}</td><td>{_pdf_esc(clean_iraqi_text(r_row[2]))}</td></tr>'
         if c_rows_h:
             comp_table_block_html = f'<div style="page-break-inside:avoid; margin:18px 0;"><div style="font-weight:bold; font-size:13pt; color:#1B3B2B; margin-bottom:6px; text-align:center;">{_esc(c_title)}</div><table class="comp-table"><thead><tr><th>{_esc(c1_h)}</th><th>{_esc(c2_h)}</th><th>{_esc(c3_h)}</th></tr></thead><tbody>{c_rows_h}</tbody></table></div>'
 
     mabahith_html = ""
     for mb in generated_mabahith:
         m_id = f"sec-mb-{mb['m_idx']}"
-        mabahith_html += f'<h2 class="sec-heading" id="{m_id}" style="margin-top:22px;">{_esc(mb["m_title"])}</h2>'
+        mabahith_html += f'<h2 class="sec-heading" id="{m_id}" style="margin-top:22px;">{_pdf_esc(mb["m_title"])}</h2>'
         for mt_i, mt in enumerate(mb["matalib"], 1):
             mt_id = f"sec-mb-{mb['m_idx']}-mt-{mt_i}"
-            mabahith_html += f'<h3 class="matlab-heading" id="{mt_id}">{_esc(mt["mt_title"])}</h3>'
+            mabahith_html += f'<h3 class="matlab-heading" id="{mt_id}">{_pdf_esc(mt["mt_title"])}</h3>'
             for p_h in mt["paras_html"]:
                 mabahith_html += f'<p class="body-p">{p_h}</p>'
         if mb["m_idx"] == len(generated_mabahith) and comp_table_block_html:
             mabahith_html += comp_table_block_html
 
-    findings_html = "".join([f'<p class="body-p" style="text-indent:0;"><strong>{i}.</strong> {_esc(x.rstrip(".")) + "."}</p>' for i, x in enumerate(healed_findings, 1)])
-    recs_html = "".join([f'<p class="body-p" style="text-indent:0;"><strong>{i}.</strong> {_esc(x.rstrip(".")) + "."}</p>' for i, x in enumerate(healed_recs, 1)])
+    findings_html = "".join([f'<p class="body-p" style="text-indent:0;"><strong>{i}.</strong> {_pdf_esc(x.rstrip(".")) + "."}</p>' for i, x in enumerate(healed_findings, 1)])
+    recs_html = "".join([f'<p class="body-p" style="text-indent:0;"><strong>{i}.</strong> {_pdf_esc(x.rstrip(".")) + "."}</p>' for i, x in enumerate(healed_recs, 1)])
 
     refs_html = ""
     for tier_obj in (calib.get("formatted_reference_tiers") or []):
@@ -1469,10 +1630,10 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
             items_li = "".join([f'<li>{format_reference_html_safe(r_it, is_english_ref=is_ltr_tier)}</li>' for r_it in t_items])
             refs_html += f'<h3 class="ref-cat-heading">{_esc(t_title)}</h3><ol class="ref-list"{dir_attr}>{items_li}</ol>'
 
-    intro_ps_html = "".join([f'<p class="body-p">{_esc(p.rstrip(".")) + "."}</p>' for p in intro_paras])
-    imp_ps_html = "".join([f'<p class="body-p">{_esc(p.rstrip(".")) + "."}</p>' for p in imp_paras])
-    method_ps_html = "".join([f'<p class="body-p">{_esc(p.rstrip(".")) + "."}</p>' for p in method_paras])
-    safe_css_title = truncate_title_by_words(clean_iraqi_text(title_ar), 65)
+    intro_ps_html = "".join([f'<p class="body-p">{_pdf_esc(p.rstrip(".")) + "."}</p>' for p in intro_paras])
+    imp_ps_html = "".join([f'<p class="body-p">{_pdf_esc(p.rstrip(".")) + "."}</p>' for p in imp_paras])
+    method_ps_html = "".join([f'<p class="body-p">{_pdf_esc(p.rstrip(".")) + "."}</p>' for p in method_paras])
+    safe_css_title = truncate_title_by_words(clean_iraqi_text(title_ar), 85)
     top_logos_html, center_trio_html = get_cover_graphics_html(order_info.get("category_code", "humanities"))
 
     html_content = f"""<!DOCTYPE html>
@@ -1505,6 +1666,7 @@ body {{
 .sec-heading {{ font-size: 17.5pt; font-weight: bold; color: #7A1C24; border-bottom: 1.5px solid #7A1C24; padding-bottom: 4px; margin-top: 18px; margin-bottom: 10px; page-break-after: avoid; }}
 .matlab-heading {{ font-size: 15pt; font-weight: bold; color: #1B3B2B; border-right: 4px solid #B38F40; padding-right: 9px; margin-top: 14px; margin-bottom: 8px; page-break-after: avoid; }}
 .body-p {{ margin-top: 0; margin-bottom: 10px; text-align: justify; text-indent: 1.15cm; orphans: 3; widows: 3; }}
+.toc-table tr {{ page-break-inside: avoid; }}
 .toc-table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12.5pt; }}
 .toc-table th {{ background-color: #1B3B2B; color: #FFF; padding: 7px 10px; border: 1px solid #1B3B2B; }}
 .toc-table td {{ padding: 6px 10px; border-bottom: 1px dotted #B8B0A4; }}
@@ -1533,7 +1695,7 @@ span.fn-call {{ float: footnote; font-size: 9pt; line-height: 1.38; color: #222;
 <div class="cover-univ">{_esc(order_info['university_name'])}</div>
 <div class="cover-college">{_esc(order_info['college_name'])}</div>
 <div class="cover-kicker">{_esc(specialty)}</div>
-<div class="cover-title-box"><div class="cover-main-title">{_esc(title_ar)}</div></div>
+<div class="cover-title-box"><div class="cover-main-title">{_pdf_esc(title_ar)}</div></div>
 {center_trio_html}
 <div class="cover-meta"><div><strong>إعداد الباحث:</strong> {_esc(order_info['student_name'])}</div><div><strong>بإشراف الأستاذ:</strong> {_esc(order_info['supervisor_name'])}</div></div>
 <div class="cover-year">السنة الدراسية {_esc(order_info['academic_year'])}</div>
@@ -1554,7 +1716,7 @@ span.fn-call {{ float: footnote; font-size: 9pt; line-height: 1.38; color: #222;
 {mabahith_html}
 
 <h2 class="sec-heading" id="sec-conc" style="margin-top:22px;">الخاتمة: الاستنتاجات والتوصيات</h2>
-<p class="body-p">{_esc(clean_iraqi_text(conc_data.get('conclusion_intro') or '').rstrip('.')) + '.'}</p>
+<p class="body-p">{_pdf_esc(clean_iraqi_text(conc_data.get('conclusion_intro') or '').rstrip('.')) + '.'}</p>
 <h3 class="matlab-heading">أولاً: الاستنتاجات</h3>
 {findings_html}
 <h3 class="matlab-heading">ثانياً: التوصيات والمقترحات</h3>
@@ -1610,20 +1772,24 @@ span.fn-call {{ float: footnote; font-size: 9pt; line-height: 1.38; color: #222;
     for p in method_paras:
         add_para(doc, p.rstrip(".") + ".", size=font_sz, indent_first_line=True)
 
-    for mb in generated_mabahith:
-        add_banner_heading(doc, mb["m_title"], size=16)
+    for mb_i, mb in enumerate(generated_mabahith):
+        add_banner_heading(doc, mb["m_title"], size=16, page_break_before=(mb_i > 0))
+        mb_all_fns = []
         for mt in mb["matalib"]:
             add_para(doc, mt["mt_title"], size=font_sz, bold=True, color_rgb=(0x1F, 0x4E, 0x78))
             for p_d in mt["paras_docx"]:
                 add_para(doc, p_d, size=font_sz, indent_first_line=True)
             if mt["local_fns"]:
-                p_line = doc.add_paragraph()
-                p_line.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                r_l = p_line.add_run("ــــــــــــــــــــــــــــــــــــــــــــــــــــــــ")
-                r_l.font.size = Pt(10)
-                r_l.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-                for fn_num_d, fn_txt_d in mt["local_fns"]:
-                    add_para(doc, f"({fn_num_d}) {fn_txt_d}", size=10.5, color_rgb=(0x33, 0x33, 0x33))
+                mb_all_fns.extend(mt["local_fns"])
+        if mb_all_fns:
+            p_line = doc.add_paragraph()
+            p_line.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p_line.paragraph_format.space_before = Pt(10)
+            r_l = p_line.add_run("ــــــــــــــــــــــــــــــــــــــــــــــــــــــــ")
+            r_l.font.size = Pt(10)
+            r_l.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+            for fn_num_d, fn_txt_d in mb_all_fns:
+                add_para(doc, f"({fn_num_d}) {fn_txt_d}", size=10.5, color_rgb=(0x33, 0x33, 0x33))
 
     if calib.get("include_comparison_table", True) and comp_rows:
         c1_h = clean_iraqi_text(comp_tbl.get("col1_header") or "وجه المقارنة")
@@ -1900,7 +2066,7 @@ def build_complete_graduation_thesis(uid, order_info):
         عنوان البحث: «{title_ar}» — التخصص: «{specialty}».
         القسم المطلوب كتابته الآن: «{sec_head}».
         المهمة التفصيلية: {sec_task}
-        المراجع الحقيقية المعتمدة للتوثيق داخل المتن (استشهد بها بصيغة (المؤلف، السنة)): {citations_str}.
+        المراجع المعتمدة: {citations_str}. (استشهد بمعدل مرجع واحد أو مرجعين فقط في كل فقرة بصيغة (اللقب، السنة) بشكل طبيعي).
         تجنب تكرار ما سبق: {anti_rep}.
 
         أخرج كائن JSON بالحقول التالية:
@@ -2098,7 +2264,7 @@ def build_ultimate_spss_pack(uid, order_info):
         rc[5].text = f"{item_s[2]:.3f}"
         rc[6].text = f"{item_s[1]:.3f}"
         rc[7].text = item_s[0]
-    style_zebra_table(t2, col_widths_cm=[1.0, 1.3, 1.3, 1.3, 1.3, 1.4, 1.4, 7.2], text_col_idx=7)
+    style_zebra_table(t2, col_widths_cm=[1.15, 1.35, 1.25, 1.25, 1.35, 1.35, 1.35, 6.45], text_col_idx=7)
 
     overall_mean = float(num_df.values.mean())
     overall_sd = float(num_df.values.std(ddof=1))
@@ -2130,7 +2296,7 @@ def build_ultimate_spss_pack(uid, order_info):
         rq = tq.add_row().cells
         rq[5].text = clean_iraqi_text(itm)
         rq[6].text = str(idx_q)
-    style_zebra_table(tq, col_widths_cm=[1.5, 1.5, 1.4, 1.4, 1.5, 7.6, 1.2], text_col_idx=5)
+    style_zebra_table(tq, col_widths_cm=[1.6, 1.5, 1.3, 1.6, 1.6, 6.8, 1.1], text_col_idx=5)
 
     word_file = f"StatLab_SPSS_Complete_{uid}_{ts_tag}.docx"
     sanitize_docx_forensics(doc, word_file)
@@ -2231,7 +2397,7 @@ def build_english_or_bologna_report(uid, order_info, is_english=False):
         cites_str = ", ".join([f"({c})" for c in en_cites[:10]])
         eng_prompt = f"""
         Topic: "{title_ar}" — Field: "{specialty}" — University: "{order_info['university_name']}" — College: "{order_info['college_name']}".
-        Write a comprehensive, formal academic research paper in English (with Google Search verification for authentic APA references).
+        Write a comprehensive, formal academic research paper in English. Cite the listed APA references naturally inside the paragraphs as (Surname, Year) — 1 to 2 citations per paragraph. Verified sources to cite: {cites_str}. Do NOT include a References section inside "sections".
         Output JSON:
         {{
           "translated_title": "Formal English Academic Title",
@@ -2259,10 +2425,11 @@ def build_english_or_bologna_report(uid, order_info, is_english=False):
         kw_en_clean = clean_iraqi_text(eng_data.get("keywords_en") or "", is_english=True).strip("[]'\" ")
         apa_refs = [clean_iraqi_text(r, is_english=True, preserve_urls=True, is_reference=True) for r in (eng_data.get("apa_references") or []) if len(str(r)) > 12]
 
+        en_acad_yr = re.sub(r"[^0-9\-—\s]", "", str(order_info.get("academic_year") or "")).strip()
         doc = setup_iraqi_document(is_english=True, header_title=t_en)
         add_para(doc, f"Republic of Iraq\nMinistry of Higher Education and Scientific Research\n{u_en} — {c_en}\n{sp_en}", size=14, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, is_english=True)
         add_para(doc, f"\n\"{t_en}\"\n", size=18, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, is_english=True, color_rgb=(0x7A, 0x1C, 0x24))
-        add_para(doc, f"Prepared by: {order_info['student_name']}\nSupervised by: {order_info['supervisor_name']}\nAcademic Year: {order_info['academic_year']}", size=13, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, is_english=True)
+        add_para(doc, f"Prepared by: {order_info['student_name']}\nSupervised by: {order_info['supervisor_name']}\nAcademic Year: {en_acad_yr}", size=13, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, is_english=True)
 
         add_banner_heading(doc, "Abstract", 15, is_english=True, page_break_before=True)
         add_para(doc, clean_iraqi_text(eng_data.get("abstract_en") or "", is_english=True), size=13, is_english=True)
@@ -2271,8 +2438,10 @@ def build_english_or_bologna_report(uid, order_info, is_english=False):
         sec_html_blocks = ""
         for sec_obj in (eng_data.get("sections") or []):
             h_en = clean_iraqi_text(sec_obj.get("heading") or "Section", is_english=True)
+            if h_en.strip().lower() in ("references", "bibliography"):
+                continue
             add_banner_heading(doc, h_en, 14.5, is_english=True)
-            sec_html_blocks += f'<h2 style="color:#1F4E78; border-bottom:1.5px solid #1F4E78; padding-bottom:4px; margin-top:20px;">{_esc(h_en)}</h2>'
+            sec_html_blocks += f'<h2 style="color:#1F4E78; border-bottom:1.5px solid #1F4E78; padding-bottom:4px; margin-top:20px; text-align:left;">{_esc(h_en)}</h2>'
             for p_en in (sec_obj.get("paragraphs") or []):
                 p_clean_en = clean_iraqi_text(p_en, is_english=True).rstrip(".") + "."
                 add_para(doc, p_clean_en, size=13, is_english=True)
@@ -2289,7 +2458,7 @@ def build_english_or_bologna_report(uid, order_info, is_english=False):
         pdf_out = f"StatLab_English_Research_{uid}_{ts_tag}.pdf"
         if HAS_WEASYPRINT:
             try:
-                en_html = f"""<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="UTF-8"><style>@page {{ size: A4; margin: 24mm 22mm; @bottom-center {{ content: counter(page); font-size: 10pt; }} }} body {{ font-family: 'Times New Roman', 'DejaVu Serif', serif; font-size: 13pt; line-height: 1.68; color: #1A1A1A; direction: ltr; text-align: justify; }}</style></head><body><div style="text-align:center; padding-top:35px;"><div style="font-size:15pt; font-weight:bold; color:#1B3B2B;">Republic of Iraq<br>Ministry of Higher Education and Scientific Research<br>{_esc(u_en)} — {_esc(c_en)}<br>{_esc(sp_en)}</div><div style="margin:28px 10px; padding:18px; border-top:2px solid #9A7B4F; border-bottom:2px solid #9A7B4F; background:#FAF6F0; font-size:20pt; font-weight:bold; color:#7A1C24;">{_esc(t_en)}</div><div style="font-size:13pt; margin-top:25px; line-height:1.9;"><strong>Prepared by:</strong> {_esc(order_info['student_name'])}<br><strong>Supervised by:</strong> {_esc(order_info['supervisor_name'])}<br><br><strong>Academic Year:</strong> {_esc(order_info['academic_year'])}</div></div><div style="page-break-before:always;"></div><h2 style="color:#1F4E78; border-bottom:1.5px solid #1F4E78;">Abstract</h2><p>{_esc(clean_iraqi_text(eng_data.get('abstract_en') or '', is_english=True))}</p><p><strong>Keywords:</strong> {_esc(kw_en_clean)}.</p>{sec_html_blocks}<h2 style="color:#1F4E78; border-bottom:1.5px solid #1F4E78; margin-top:22px;">References</h2><ol>{refs_en_html}</ol></body></html>"""
+                en_html = f"""<!DOCTYPE html><html lang="en" dir="ltr"><head><meta charset="UTF-8"><style>@page {{ size: A4; margin: 24mm 22mm; @bottom-center {{ content: counter(page); font-size: 10pt; }} }} body {{ font-family: 'Times New Roman', 'DejaVu Serif', serif; font-size: 13pt; line-height: 1.68; color: #1A1A1A; direction: ltr; text-align: justify; }}</style></head><body><div style="text-align:center; padding-top:35px;"><div style="font-size:15pt; font-weight:bold; color:#1B3B2B;">Republic of Iraq<br>Ministry of Higher Education and Scientific Research<br>{_esc(u_en)} — {_esc(c_en)}<br>{_esc(sp_en)}</div><div style="margin:28px 10px; padding:18px; border-top:2px solid #9A7B4F; border-bottom:2px solid #9A7B4F; background:#FAF6F0; font-size:20pt; font-weight:bold; color:#7A1C24;">{_esc(t_en)}</div><div style="font-size:13pt; margin-top:25px; line-height:1.9;"><strong>Prepared by:</strong> {_esc(order_info['student_name'])}<br><strong>Supervised by:</strong> {_esc(order_info['supervisor_name'])}<br><br><strong>Academic Year:</strong> {_esc(en_acad_yr)}</div></div><div style="page-break-before:always;"></div><h2 style="color:#1F4E78; border-bottom:1.5px solid #1F4E78;">Abstract</h2><p>{_esc(clean_iraqi_text(eng_data.get('abstract_en') or '', is_english=True))}</p><p><strong>Keywords:</strong> {_esc(kw_en_clean)}.</p>{sec_html_blocks}<h2 style="color:#1F4E78; border-bottom:1.5px solid #1F4E78; margin-top:22px;">References</h2><ol>{refs_en_html}</ol></body></html>"""
                 weasyprint.HTML(string=en_html).write_pdf(pdf_out)
             except Exception:
                 pdf_out = convert_docx_to_pdf_fallback(fname)
@@ -2351,7 +2520,7 @@ def build_english_or_bologna_report(uid, order_info, is_english=False):
         sec_b_prompt = f"""
         عنوان التقرير: «{title_ar}» — التخصص: «{specialty}».
         المحور الحالي: «{m_t}» (ويشمل: {sub_t}).
-        المراجع المعتمدة للتوثيق داخل المتن: {cites_str_ar}.
+        المراجع المعتمدة: {cites_str_ar}. (وثّق بمعدل مرجع واحد إلى مرجعين فقط في كل فقرة بشكل طبيعي ولا تحشر أكثر من مرجعين في نفس الفقرة).
         اكتب 3 فقرات تحليلية معمقة وموثقة (390 كلمة) تغطي هذا المحور بصيغة JSON:
         {{
           "paragraphs": ["الفقرة الأولى الموثقة...", "الفقرة الثانية الموثقة...", "الفقرة الثالثة الموثقة..."]
@@ -2428,7 +2597,11 @@ def _safe_edit_html(chat_id, msg_id, html_text, reply_markup=None):
     try:
         bot.edit_message_text(html_text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML", reply_markup=reply_markup)
     except Exception:
-        pass
+        try:
+            plain_t = re.sub(r'<[^>]+>', '', str(html_text))
+            bot.edit_message_text(plain_t, chat_id=chat_id, message_id=msg_id, reply_markup=reply_markup)
+        except Exception:
+            pass
 
 def get_master_keyboard(uid):
     markup = InlineKeyboardMarkup(row_width=1)
