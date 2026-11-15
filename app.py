@@ -823,6 +823,17 @@ def parse_and_calibrate_order(raw_user_text):
     ar_refs_list = [clean_iraqi_text(x, is_reference=True) for x in (calib_data.get("references_ar") or []) if len(str(x).strip()) > 12]
     en_refs_list = [] if is_doctrinal else [clean_iraqi_text(x, is_english=True, preserve_urls=True, is_reference=True) for x in (calib_data.get("references_en") or []) if len(str(x).strip()) > 12]
 
+    _ar_only_refs, _moved_en_refs = [], []
+    for _r_item in ar_refs_list:
+        if len(re.findall(r'[a-zA-Z]', str(_r_item))) > len(re.findall(r'[\u0621-\u064A]', str(_r_item))) * 1.3:
+            if not is_doctrinal:
+                _moved_en_refs.append(clean_iraqi_text(_r_item, is_english=True, preserve_urls=True, is_reference=True))
+        else:
+            _ar_only_refs.append(_r_item)
+    ar_refs_list = _ar_only_refs
+    if not is_doctrinal:
+        en_refs_list = list(dict.fromkeys(en_refs_list + _moved_en_refs))
+
     arabic_tier_ords = ["أولاً", "ثانياً", "ثالثاً"]
     formatted_tiers = []
     if books_list:
@@ -1276,9 +1287,9 @@ def setup_iraqi_document(is_english=False, header_title=""):
         if header_title:
             hdr = section.header.paragraphs[0]
             hdr.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            rh = hdr.add_run(truncate_title_by_words(clean_iraqi_text(header_title), 85))
+            rh = hdr.add_run(truncate_title_by_words(clean_iraqi_text(header_title), 115))
             rh.font.name = "Arial"
-            rh.font.size = Pt(9.5)
+            rh.font.size = Pt(8.5)
             rh.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
         add_page_number_to_footer(section.footer.paragraphs[0])
     return doc
@@ -1480,6 +1491,8 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
     method_paras = [clean_iraqi_text(p) for p in (intro_data.get("methodology_plan_paragraphs") or []) if p]
 
     order_info["_used_ref_lines"] = []
+    order_info["_prev_fn_idx"] = -1
+    order_info["_fn_use_cnt"] = {}
     generated_mabahith = []
     global_footnotes = []
     used_ref_counts = {}
@@ -1537,12 +1550,18 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
                 chosen_idx = raw_choice % len(pool_objs)
                 years_in_para = [int(y) for y in re.findall(r'\b(20\d{2})\b', p_clean)]
                 max_para_yr = max(years_in_para) if years_in_para else 0
-                if max_para_yr >= 2015:
-                    ref_yrs = [int(y) for y in re.findall(r'\b((?:19|20)\d{2})\b', pool_objs[chosen_idx]["ref_line"])]
-                    if ref_yrs and ref_yrs[0] < max_para_yr:
-                        newer_c = [idx_k for idx_k, obj_k in enumerate(pool_objs) if any(int(ry) >= max_para_yr for ry in re.findall(r'\b((?:19|20)\d{2})\b', obj_k["ref_line"]))]
-                        if newer_c:
-                            chosen_idx = newer_c[p_i % len(newer_c)]
+                valid_pool = list(range(len(pool_objs)))
+                if max_para_yr >= 2023:
+                    newer_c = [idx_k for idx_k, obj_k in enumerate(pool_objs) if any(int(ry) >= max_para_yr for ry in re.findall(r'\b((?:19|20)\d{2})\b', obj_k["ref_line"]))]
+                    if newer_c:
+                        valid_pool = newer_c
+                prev_idx = order_info.get("_prev_fn_idx", -1)
+                fn_cnts = order_info.setdefault("_fn_use_cnt", {})
+                if (chosen_idx not in valid_pool) or (chosen_idx == prev_idx and len(valid_pool) > 1) or (fn_cnts.get(chosen_idx, 0) >= 4 and len(valid_pool) > 1):
+                    valid_pool.sort(key=lambda idx_k: (idx_k == prev_idx, fn_cnts.get(idx_k, 0)))
+                    chosen_idx = valid_pool[0]
+                order_info["_prev_fn_idx"] = chosen_idx
+                fn_cnts[chosen_idx] = fn_cnts.get(chosen_idx, 0) + 1
                 order_info.setdefault("_used_ref_lines", []).append(pool_objs[chosen_idx]["ref_line"])
 
                 fn_content = pool_objs[chosen_idx]["ref_line"]
@@ -1650,7 +1669,7 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
     intro_ps_html = "".join([f'<p class="body-p">{_pdf_esc(p.rstrip(".")) + "."}</p>' for p in intro_paras])
     imp_ps_html = "".join([f'<p class="body-p">{_pdf_esc(p.rstrip(".")) + "."}</p>' for p in imp_paras])
     method_ps_html = "".join([f'<p class="body-p">{_pdf_esc(p.rstrip(".")) + "."}</p>' for p in method_paras])
-    safe_css_title = truncate_title_by_words(clean_iraqi_text(title_ar), 85)
+    safe_css_title = truncate_title_by_words(clean_iraqi_text(title_ar), 115)
     top_logos_html, center_trio_html = get_cover_graphics_html(order_info.get("category_code", "humanities"))
 
     html_content = f"""<!DOCTYPE html>
@@ -1660,7 +1679,7 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
 <style>
 @page {{
     size: A4; margin: 22mm 20mm 22mm 20mm;
-    @top-center {{ content: "{safe_css_title}"; font-family: 'Noto Naskh Arabic', 'Amiri', 'DejaVu Serif', serif; font-size: 9pt; color: #666; border-bottom: 0.5pt solid #D8D2C8; padding-bottom: 3px; margin-bottom: 6px; }}
+    @top-center {{ content: "{safe_css_title}"; font-family: 'Noto Naskh Arabic', 'Amiri', 'DejaVu Serif', serif; font-size: 7.8pt; color: #666; border-bottom: 0.5pt solid #D8D2C8; padding-bottom: 3px; margin-bottom: 6px; }}
     @bottom-center {{ content: counter(page); font-family: 'Noto Naskh Arabic', 'Amiri', 'DejaVu Serif', serif; font-size: 10.5pt; font-weight: bold; color: #7A1C24; }}
     @footnote {{ border-top: 0.8pt solid #999; padding-top: 4px; margin-top: 6px; }}
 }}
