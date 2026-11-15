@@ -212,6 +212,16 @@ def add_user_credits(uid, amount):
     _sync_file_to_github(CREDITS_DB_FILE, raw_j)
     return db[str(uid)]
 
+def consume_credit_or_reject(uid):
+    if int(uid) == ADMIN_ID:
+        return True
+    bal = get_user_credits(uid)
+    if bal <= 0:
+        bot.send_message(uid, "💳 <b>نفد رصيدك الأكاديمي!</b> تواصل مع الإدارة لشحن رصيد المكتب.", parse_mode="HTML")
+        return False
+    add_user_credits(uid, -1)
+    return True
+
 def load_learned_memory():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -222,6 +232,7 @@ def load_learned_memory():
     return [
         "التزم بالأسلوب الأكاديمي الرصين والمباشر دون سرد لأسماء الباحثين، وتجنب تكرار القوالب الإنشائية أو نفس الجمل الاستهلالية بين الفقرات.",
         "حافظ على التناسق الزمني والعلمي الصارم: يُمنع عزو أي تشريع أو تقنية أو دراسة حديثة إلى مصدر منشور قبل تاريخها، ولا تخمن أرقام مواد قانونية أو معادلات غير موثقة.",
+        "في التقارير والبحوث النظرية، يُمنع ادعاء إجراء مسح ميداني أو استبيان أو تجربة أو استخراج نتائج SPSS غير مرفقة بياناتها وأرقامها في التقرير، وعند غياب البيانات الفعلية يُكتفى بالتحليل الواقعي وتصميم أداة القياس أو الإطار المقترح.",
         "التزم حصراً بالمراجع الحقيقية الموثقة بلغتها الأصلية، ولا تترجم مصدراً أجنبياً لإدراجه كمصدر عربي، ولا تختلق أي كتاب أو مؤلف."
     ]
 
@@ -455,20 +466,93 @@ def ask_agent(prompt_text, agent_role="writer", json_mode=True, required_keys=No
     live_ctx = f"\n\n[البصمة المنهجية والبراهين التخصصية الإلزامية لهذا البحث]:\n{live_blueprint}\n" if live_blueprint else ""
     role_prompts = {
         "scout": "أنت الوكيل المعماري الأكاديمي في الجامعات العراقية. استخرج كافة بيانات البحث وتوجيهاته بدقة بصيغة JSON.",
-        "calibrator": "أنت مهندس البحث الأكاديمي الحي. حلل موضوع البحث وتخصصه الدقيق، واستنتج المعايير والبراهين الإلزامية في هذا التخصص (كالمعادلات والوحدات في الهندسة، أو المواد التشريعية في القانون، أو البروتوكولات السريرية في الطب)، وابنِ خطة البحث والمصادر الحقيقية الموثقة بصيغة JSON.",
+        "calibrator": "أنت مهندس البحث الأكاديمي الحي. حلل موضوع البحث وتخصصه الدقيق، واستنتج المعايير والبراهين الإلزامية في هذا التخصص (كالمعادلات والوحدات في الهندسة، أو المواد التشريعية في القانون، أو البروتوكولات السريرية في الطب، أو المؤشرات المالية في الإدارة)، وابنِ خطة البحث والمصادر العراقية والعربية والأجنبية الحقيقية الموثقة بصيغة JSON.",
         "writer": (
             f"أنت باحث وأستاذ أكاديمي قدير في الجامعات العراقية.{live_ctx}\n"
             f"القواعد الحاكمة:\n{learned_str}\n"
             "قواعد الصياغة الإلزامية:\n"
-            "1. اكتب بأسلوب تحليلي عميق ومباشر يوظف الأدلة والبراهين العلمية المعتمدة في التخصص ذاته (المعادلات أو المقاييس أو النصوص أو التحليل العلمي الدقيق) دون سرد إنشائي.\n"
-            "2. نوّع بدايات الفقرات وأدوات الربط تنوعاً كاملاً في كل قسم، ويُمنع تكرار نفس الجملة الاستهلالية.\n"
-            "3. لا تضع أي رموز مرجعية مربعة مثل [0] أو [REF_1] داخل المتن، وأنهِ كل فقرة بنقطة تامة."
+            "1. اكتب بأسلوب تحليلي عميق ومباشر يوظف الأدلة والبراهين العلمية المعتمدة في التخصص ذاته دون سرد إنشائي.\n"
+            "2. يُمنع ادعاء توزيع استبيان أو إجراء تجربة أو الحصول على نتائج SPSS أو نسب ميدانية غير مرفقة في المدخلات؛ وإذا كان العنوان تطبيقياً/استطلاعياً فاقتصر في التقرير النظري على تشخيص الواقع وتصميم أداة القياس ومؤشرات التقييم المقترحة.\n"
+            "3. نوّع بدايات الفقرات وأدوات الربط تنوعاً كاملاً في كل قسم، ويُمنع تكرار نفس الجملة الاستهلالية.\n"
+            "4. لا تضع أي رموز مرجعية مربعة مثل [0] أو [REF_1] داخل المتن، وأنهِ كل فقرة بنقطة تامة."
         ),
-        "auditor": f"أنت المدقق الأكاديمي الأعلى (Editor-in-Chief).{live_ctx}\nالقواعد الحاكمة:\n{learned_str}\nافحص المسودة والمصادر بعين أستاذ جامعي فاحص، واكشف أي خطأ علمي أو تناقض زمني أو مرجع دخيل وأصلحه."
+        "auditor": f"أنت المدقق الأكاديمي الأعلى (Editor-in-Chief).{live_ctx}\nالقواعد الحاكمة:\n{learned_str}\nافحص المسودة والمصادر بعين أستاذ جامعي فاحص، واكشف أي خطأ علمي أو تناقض زمني أو ادعاء نتائج ميدانية غير موجودة وأصلحه."
     }
     sys_msg = role_prompts.get(agent_role, role_prompts["writer"])
     if json_mode and "JSON" not in prompt_text.upper():
         prompt_text += "\n\nأخرج النتيجة بصيغة JSON صالحة حصراً دون أي نص خارج قوسي { }."
+
+    def _is_valid_output(txt_out):
+        if not txt_out or len(txt_out) < 10: return False
+        if not json_mode: return True
+        parsed_obj = extract_json_safely(txt_out)
+        if not parsed_obj: return False
+        if required_keys:
+            for rk in required_keys:
+                if rk not in parsed_obj or parsed_obj[rk] in (None, "", []): return False
+        return True
+
+    user_parts = [{"text": prompt_text}]
+    if media_parts: user_parts.extend(media_parts)
+    last_non_empty = ""
+    models_to_try = ACTIVE_GEMINI_MODELS if ACTIVE_GEMINI_MODELS else ["gemini-2.5-flash", "gemini-3-flash-preview"]
+    dead_keys = set()
+
+    for wait_s in (0, 20, 38):
+        if wait_s > 0: time.sleep(wait_s)
+        num_keys = max(1, len(WORKING_GEMINI_KEYS))
+        for model_name in models_to_try:
+            model_overloaded = False
+            for _ in range(num_keys):
+                gem_key = get_next_gemini_key()
+                if not gem_key or gem_key in dead_keys: continue
+                url_gem = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gem_key}"
+                modes_to_try = [(True, False), (False, json_mode), (False, False)] if use_google_search else ([(False, True), (False, False)] if json_mode else [(False, False)])
+                for s_mode, use_mime in modes_to_try:
+                    gen_cfg = {"temperature": 0.25, "maxOutputTokens": 8192}
+                    if use_mime: gen_cfg["responseMimeType"] = "application/json"
+                    payload = {"systemInstruction": {"parts": [{"text": sys_msg}]}, "contents": [{"role": "user", "parts": user_parts}], "generationConfig": gen_cfg}
+                    if s_mode: payload["tools"] = [{"google_search": {}}]
+                    try:
+                        r_gem = _HTTP_SESSION.post(url_gem, json=payload, headers={"Content-Type": "application/json"}, timeout=90)
+                        if r_gem.status_code == 200:
+                            cands = r_gem.json().get("candidates") or []
+                            if cands:
+                                parts = cands[0].get("content", {}).get("parts") or []
+                                txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text") and not p.get("thought")])
+                                if not txt_joined.strip():
+                                    txt_joined = "\n".join([p.get("text", "") for p in parts if p.get("text")])
+                                txt = re.sub(r'<think>.*?</think>', '', txt_joined, flags=re.DOTALL).strip()
+                                if txt: last_non_empty = txt
+                                if _is_valid_output(txt): return txt
+                            break
+                        elif r_gem.status_code in (401, 403):
+                            dead_keys.add(gem_key)
+                            log_runtime_error(f"Gemini Key {r_gem.status_code}", "Key disabled")
+                            break
+                        elif r_gem.status_code == 400:
+                            log_runtime_error(f"Gemini {model_name} 400", r_gem.text[:120])
+                            continue
+                        elif r_gem.status_code == 429:
+                            log_runtime_error(f"Gemini {model_name} 429", "Search limit" if s_mode else "Rate limit")
+                            if s_mode: continue
+                            time.sleep(0.4)
+                            break
+                        elif r_gem.status_code in (404, 500, 503):
+                            log_runtime_error(f"Gemini {model_name} {r_gem.status_code}", r_gem.text[:100])
+                            model_overloaded = True
+                            break
+                        else:
+                            log_runtime_error(f"Gemini {model_name} {r_gem.status_code}", r_gem.text[:120])
+                            break
+                    except Exception as e:
+                        log_runtime_error(f"Gemini {model_name} EXC", e)
+                        break
+                if model_overloaded: break
+            if model_overloaded: continue
+
+    if last_non_empty: return last_non_empty
+    raise RuntimeError("تعذر الاتصال بمحرك Gemini حالياً، يرجى المحاولة بعد ثوانٍ.")
 
     def _is_valid_output(txt_out):
         if not txt_out or len(txt_out) < 10: return False
@@ -907,7 +991,7 @@ def parse_and_calibrate_order(raw_user_text):
     أخرج كائن JSON بالحقول التالية حصراً:
     {{
       "clean_title": "العنوان الأكاديمي الصافي",
-      "specialty": "التخصص الدقيق",
+      "specialty": "الفرع أو القسم العلمي بصيغته الرسمية في الكلية (مثلاً: قسم إدارة المصارف، أو فرع القانون الخاص، أو قسم الهندسة الكهربائية)",
       "college_name": "اسم الكلية",
       "university_name": "اسم الجامعة",
       "category_code": "law أو economics أو medical أو engineering أو humanities",
@@ -940,7 +1024,7 @@ def parse_and_calibrate_order(raw_user_text):
       }}
     }}
     """
-    calib_data = extract_json_safely(ask_agent(calib_prompt, "calibrator", True, required_keys=["clean_title", "sections_plan"]))
+    calib_data = extract_json_safely(ask_agent(calib_prompt, "calibrator", True, required_keys=["clean_title", "sections_plan"], use_google_search=True))
 
     clean_title = clean_iraqi_text(calib_data.get("clean_title") or raw_user_text[:95])
     specialty = clean_iraqi_text(calib_data.get("specialty") or "الدراسات الأكاديمية")
@@ -1002,6 +1086,7 @@ def parse_and_calibrate_order(raw_user_text):
 
     def _clean_moved_en_ref(s_ref):
         s_c = clean_iraqi_text(s_ref, is_english=True, preserve_urls=True, is_reference=True)
+        s_c = re.sub(r'\b(?:Assist\.?\s*Prof\.?|Prof\.?|Dr\.?)\s+', '', s_c, flags=re.IGNORECASE)
         s_c = re.sub(r'\s+و(?=[A-Z])', ', ', s_c)
         s_c = re.sub(r'[«»]', '"', s_c)
         s_c = re.sub(r'[،,]\s*ص\s*(\d+)', r', pp. \1', s_c)
@@ -1602,6 +1687,39 @@ def style_zebra_table(tbl, is_english=False, col_widths_cm=None, text_col_idx=No
                     run.bold = (r_idx == 0)
                     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF) if r_idx == 0 else RGBColor(0x1A, 0x1A, 0x1A)
 
+    if is_dense:
+        tblPr = tbl._tbl.tblPr
+        old_mar = tblPr.find(qn('w:tblCellMar'))
+        if old_mar is not None: tblPr.remove(old_mar)
+        tblPr.append(parse_xml(f'<w:tblCellMar {nsdecls("w")}><w:left w:w="40" w:type="dxa"/><w:right w:w="40" w:type="dxa"/><w:top w:w="45" w:type="dxa"/><w:bottom w:w="45" w:type="dxa"/></w:tblCellMar>'))
+
+    for r_idx, row in enumerate(tbl.rows):
+        trPr = row._tr.get_or_add_trPr()
+        if trPr.find(qn('w:cantSplit')) is None: trPr.append(OxmlElement('w:cantSplit'))
+        if r_idx == 0 and trPr.find(qn('w:tblHeader')) is None: trPr.append(OxmlElement('w:tblHeader'))
+        for c_idx, cell in enumerate(row.cells):
+            tcPr = cell._tc.get_or_add_tcPr()
+            if dxa_list and c_idx < len(dxa_list):
+                cell.width = Cm(col_widths_cm[c_idx])
+                old_tcW = tcPr.find(qn('w:tcW'))
+                if old_tcW is not None: tcPr.remove(old_tcW)
+                tcPr.insert(0, parse_xml(f'<w:tcW {nsdecls("w")} w:w="{dxa_list[c_idx]}" w:type="dxa"/>'))
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            fill_hex = "1F4E78" if r_idx == 0 else ("F2F6FC" if r_idx % 2 == 1 else "FFFFFF")
+            old_shd = tcPr.find(qn('w:shd'))
+            if old_shd is not None: tcPr.remove(old_shd)
+            shd_el = parse_xml(f'<w:shd {nsdecls("w")} w:val="clear" w:color="auto" w:fill="{fill_hex}"/>')
+            vAlign_el = tcPr.find(qn('w:vAlign'))
+            vAlign_el.addprevious(shd_el) if vAlign_el is not None else tcPr.append(shd_el)
+            for p in cell.paragraphs:
+                p.alignment = (WD_ALIGN_PARAGRAPH.LEFT if is_english else WD_ALIGN_PARAGRAPH.RIGHT) if (r_idx > 0 and text_col_idx is not None and c_idx == text_col_idx) else WD_ALIGN_PARAGRAPH.CENTER
+                _set_pPr_bidi_and_shd(p, is_english=is_english)
+                for run in p.runs:
+                    run.font.name = 'Times New Roman' if is_english else 'Arial'
+                    run.font.size = Pt((9 if r_idx == 0 else 8.8) if is_dense else (11 if r_idx == 0 else 10.5))
+                    run.bold = (r_idx == 0)
+                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF) if r_idx == 0 else RGBColor(0x1A, 0x1A, 0x1A)
+
     for r_idx, row in enumerate(tbl.rows):
         trPr = row._tr.get_or_add_trPr()
         if trPr.find(qn('w:cantSplit')) is None:
@@ -1665,8 +1783,8 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
 
     paras_per_sub = 3 if min_pgs <= 11 else (4 if min_pgs <= 17 else 5)
     pool_objs = order_info.get("verified_pool_with_context") or [{"ref_line": f"الدوريات العلمية المحكمة في تخصص {specialty}.", "summary": title_ar}]
-    max_ref_idx = len(pool_objs[:16]) - 1
-    refs_with_summaries_str = "\n".join([f"[REF_{i}] {r['ref_line']}" for i, r in enumerate(pool_objs[:16])])
+    max_ref_idx = len(pool_objs[:22]) - 1
+    refs_with_summaries_str = "\n".join([f"[REF_{i}] {r['ref_line']}" for i, r in enumerate(pool_objs[:22])])
 
     actual_plan_outline = "\n".join([f"- {m['mabhath_title']} (ويتناول: {'، '.join(m.get('matalib', []))})" for m in plan])
     custom_note = f"\nتوجيهات إضافية من المستخدم: {custom_inst}\n" if custom_inst else ""
@@ -1766,7 +1884,8 @@ def build_genspark_luxury_research(uid, order_info, progress_callback=None):
                     if newer_c: valid_pool = newer_c
                 prev_idx = order_info.get("_prev_fn_idx", -1)
                 fn_cnts = order_info.setdefault("_fn_use_cnt", {})
-                if (chosen_idx not in valid_pool) or (chosen_idx == prev_idx and len(valid_pool) > 1) or (fn_cnts.get(chosen_idx, 0) >= 4 and len(valid_pool) > 1):
+                max_rep_allowed = 2 if len(valid_pool) >= 4 else 4
+                if (chosen_idx not in valid_pool) or (chosen_idx == prev_idx and len(valid_pool) > 1) or (fn_cnts.get(chosen_idx, 0) >= max_rep_allowed and len(valid_pool) > 1):
                     valid_pool.sort(key=lambda idx_k: (idx_k == prev_idx, fn_cnts.get(idx_k, 0)))
                     chosen_idx = valid_pool[0]
                 order_info["_prev_fn_idx"] = chosen_idx
@@ -2635,6 +2754,44 @@ def build_seminar_pptx(uid, order_info):
     prs.save(pptx_file)
     return pptx_file
 
+    p_tit = tf_c.add_paragraph()
+    p_tit.text = f"\n« {title_ar} »\n"
+    p_tit.font.size, p_tit.font.bold, p_tit.font.color.rgb, p_tit.alignment = PptPt(24), True, PptRGB(0xFF, 0xD9, 0x66), PP_ALIGN.CENTER
+    _set_ppt_para_rtl(p_tit)
+
+    p_sub = tf_c.add_paragraph()
+    p_sub.text = f"عرض تقديمي للمناقشة العلمية\nإعداد الباحث: {order_info['student_name']}  |  إشراف: {order_info['supervisor_name']}\nالسنة الدراسية: {order_info['academic_year']}"
+    p_sub.font.size, p_sub.font.color.rgb, p_sub.alignment = PptPt(14), PptRGB(0xFF, 0xFF, 0xFF), PP_ALIGN.CENTER
+    _set_ppt_para_rtl(p_sub)
+
+    for sl in slides_data:
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        f_s = slide.background.fill
+        f_s.solid()
+        f_s.fore_color.rgb = PptRGB(0xF8, 0xFA, 0xFC)
+        title_shp = slide.shapes.title
+        title_shp.left, title_shp.top, title_shp.width, title_shp.height = PptInches(0.6), PptInches(0.35), PptInches(8.8), PptInches(1.15)
+        title_shp.text = clean_iraqi_text(sl.get("title", ""))
+        title_shp.text_frame.word_wrap = True
+        p_t = title_shp.text_frame.paragraphs[0]
+        p_t.font.size, p_t.font.bold, p_t.font.color.rgb, p_t.alignment = PptPt(23), True, PptRGB(0x1F, 0x4E, 0x78), PP_ALIGN.RIGHT
+        _set_ppt_para_rtl(p_t)
+
+        body_shp = slide.placeholders[1]
+        body_shp.left, body_shp.top, body_shp.width, body_shp.height = PptInches(0.6), PptInches(1.65), PptInches(8.8), PptInches(5.3)
+        tf = body_shp.text_frame
+        tf.word_wrap = True
+        for p_idx, pt_txt in enumerate(sl.get("points", [])):
+            p = tf.paragraphs[0] if p_idx == 0 else tf.add_paragraph()
+            p.text = f"❖ {clean_iraqi_text(pt_txt)}"
+            p.font.size, p.font.color.rgb, p.alignment = PptPt(16.5), PptRGB(0x1A, 0x1A, 0x1A), PP_ALIGN.RIGHT
+            p.space_after = PptPt(10)
+            _set_ppt_para_rtl(p)
+
+    pptx_file = f"StatLab_Seminar_{uid}_{ts_tag}.pptx"
+    prs.save(pptx_file)
+    return pptx_file
+
     s_prompt = f"""
     صمم محتوى عرض تقديمي جامعي احترافي (سمنار مناقشة) من 10 شرائح علمية لبحث بعنوان: «{title_ar}» في تخصص ({specialty}).
     التزم بعناوين وهيكل البحث الفعلي التالي:
@@ -3048,6 +3205,8 @@ def learn_new_rule_cmd(message):
         bot.reply_to(message, f"🧠 <b>تم حفظ القاعدة الأكاديمية للأبد!</b>\n({_esc(rule_txt)})", parse_mode="HTML")
 
 def _execute_factory_for_user(uid, order_info, factory_code="m_gen"):
+    if not consume_credit_or_reject(uid):
+        return
     title_ar = order_info["clean_title"]
     if factory_code == "m_gen":
         msg_w = bot.send_message(uid, f"🚀 <b>انطلق التنفيذ بـ Gemini 3.8 Flash!</b>\n📌 «{_esc(title_ar)}»\n⏳ [1/4] جاري التأليف والتدقيق الشامل...", parse_mode="HTML")
@@ -3080,6 +3239,8 @@ def handle_research_order(message):
 
     if uid in awaiting_paraphrase_uids:
         awaiting_paraphrase_uids.discard(uid)
+        if not consume_credit_or_reject(uid):
+            return
         w_msg = bot.reply_to(message, "⏳ <b>جاري إعادة الصياغة الأكاديمية وخفض الاستلال...</b>", parse_mode="HTML")
         docx_p, pdf_p = None, None
         try:
@@ -3156,6 +3317,10 @@ def handle_all_callbacks(call):
     if not order_info:
         _safe_answer_cb(call.id, "⚠️ أرسل عنوان البحث أولاً!")
         bot.send_message(uid, "⚠️ أرسل عنوان البحث في رسالة عادية أولاً.", parse_mode="HTML")
+        return
+
+    if not data.startswith("m_gen_") and not consume_credit_or_reject(uid):
+        _safe_answer_cb(call.id, "💳 نفد الرصيد")
         return
 
     try:
